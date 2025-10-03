@@ -28,10 +28,31 @@ const STOPWORDS = new Set([
     'him', 'her', 'his', 'hers', 'its', 'our', 'out', 'into', 'onto', 'because', 'been', 'can'
 ]);
 
-const SYSTEM_PROMPT = `You are ${BOT_NAME}, a warm and professional WhatsApp assistant.
+const SYSTEM_PROMPT = `You are ${BOT_NAME}, a warm, professional, and safety-conscious WhatsApp assistant.
 - Always introduce yourself as ${BOT_NAME} when asked who you are.
 - Keep answers short and conversational (2-4 sentences unless the user explicitly asks for more).
-- If you are unsure about something, be honest and offer to help look it up.`;
+- If you are unsure about something, be honest and offer to help look it up.
+- Never provide harmful, harassing, or disallowed content. Decline requests for personal, medical, legal, or financial advice and instead offer general guidance.`;
+
+const RATE_LIMIT_MS = 2500; // minimum delay between replies per chat
+const MAX_MESSAGE_LENGTH = 1200; // guard against overly long inputs
+const SENSITIVE_PATTERNS = [
+    {
+        name: 'payment card number',
+        regex: /\b(?:\d[ -]*?){13,19}\b/, // simplistic credit card detector
+        response: 'For your safety, please avoid sharing payment card numbers here. If you need help, try describing the situation without sensitive details.'
+    },
+    {
+        name: 'national ID',
+        regex: /\b\d{3}[- ]?\d{2}[- ]?\d{4}\b/, // SSN-like
+        response: 'I spotted something that looks like a personal identification number. Please keep that private and share only non-sensitive information.'
+    }
+];
+
+const SAFE_FAILURE_MESSAGE = "I'm sorry, but I can't help with that.";
+const PRIVACY_SUMMARY = `${BOT_NAME} stores a limited rolling history per chat to stay helpful. You can clear it any time with ${COMMAND_PREFIX}reset.`;
+
+const chatCooldowns = new Map();
 // ----------------------------------------
 
 const client = new Client({
@@ -49,6 +70,53 @@ function readJsonFile(filePath, fallback) {
         console.warn(`⚠️ Unable to read ${filePath}. Using fallback.`, error);
         return fallback;
     }
+}
+
+async function moderateContent(text, type = 'input') {
+    if (!text) return { flagged: false, categories: [], type };
+
+    try {
+        const result = await openai.moderations.create({
+            model: 'omni-moderation-latest',
+            input: text
+        });
+
+        const flagged = result?.results?.[0]?.flagged ?? false;
+        const categories = Object.entries(result?.results?.[0]?.categories || {})
+            .filter(([, value]) => Boolean(value))
+            .map(([key]) => key.replace(/_/g, ' '));
+
+        return {
+            flagged,
+            categories,
+            type
+        };
+    } catch (error) {
+        console.warn('⚠️ Moderation request failed:', error);
+        return { flagged: false, categories: [], type };
+    }
+}
+
+function checkSensitivePatterns(text) {
+    if (!text) return null;
+
+    for (const pattern of SENSITIVE_PATTERNS) {
+        if (pattern.regex.test(text)) {
+            return pattern.response;
+        }
+    }
+
+    return null;
+}
+
+function isRateLimited(chatId) {
+    const last = chatCooldowns.get(chatId) || 0;
+    if (Date.now() - last < RATE_LIMIT_MS) {
+        return true;
+    }
+
+    chatCooldowns.set(chatId, Date.now());
+    return false;
 }
 
 let memory = readJsonFile(MEMORY_FILE, {});
@@ -132,6 +200,28 @@ function appendResponse(chatId, record) {
     }
 
     saveAllResponses();
+}
+
+function recordInteraction(chatId, userMessage, reply, source = 'system') {
+    if (userMessage) {
+        appendToHistory(chatId, { role: 'user', content: userMessage });
+    }
+
+    if (reply) {
+        appendToHistory(chatId, { role: 'assistant', content: reply });
+    }
+
+    appendResponse(chatId, {
+        message: userMessage,
+        reply,
+        timestamp: new Date().toISOString(),
+        source
+    });
+}
+
+async function sendWithTyping(message, text) {
+    await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
+    await message.reply(text);
 }
 
 function extractKeywords(text) {
@@ -222,15 +312,6 @@ async function getAIReply(chatId, message) {
             throw new Error('Empty response from OpenAI');
         }
 
-        appendToHistory(chatId, { role: 'user', content: message });
-        appendToHistory(chatId, { role: 'assistant', content: reply });
-
-        appendResponse(chatId, {
-            message,
-            reply,
-            timestamp: new Date().toISOString()
-        });
-
         return reply;
     } catch (error) {
         console.error('OpenAI error:', error);
@@ -245,6 +326,9 @@ function buildHelpMessage() {
         `${COMMAND_PREFIX}help - Show this help message`,
         `${COMMAND_PREFIX}reset - Clear our conversation history for this chat`,
         `${COMMAND_PREFIX}history - Summarise the latest conversation context`,
+        `${COMMAND_PREFIX}policy - Read how I keep conversations safe`,
+        `${COMMAND_PREFIX}privacy - Understand what I store`,
+        `${COMMAND_PREFIX}stats - See usage insights for this chat`,
         `${COMMAND_PREFIX}about - Learn more about ${BOT_NAME}`
     ].join('\n');
 }
@@ -265,6 +349,50 @@ function formatHistorySummary(chatId) {
     return `Here\'s the latest context I\'m using:\n${lines.join('\n')}`;
 }
 
+function buildPolicyMessage() {
+    return [
+        `${BOT_NAME} follows clear safety rules:`,
+        '• I use OpenAI moderation to screen sensitive or unsafe requests.',
+        '• I may refuse or redirect conversations that involve harmful, personal, or adult content.',
+        '• Please avoid sharing private information such as passwords, credit card numbers, or IDs.'
+    ].join('\n');
+}
+
+function buildPrivacyMessage() {
+    return [
+        PRIVACY_SUMMARY,
+        'I never store attachments, media, or metadata—only short snippets of text needed for context.',
+        `Use ${COMMAND_PREFIX}reset at any time if you want me to forget our conversation.`
+    ].join('\n');
+}
+
+function buildStatsMessage(chatId) {
+    const responses = allResponses[chatId] || [];
+    const total = responses.length;
+    const openAIResponses = responses.filter((entry) => entry.source === 'openai').length;
+    const memoryResponses = responses.filter((entry) => entry.source === 'memory').length;
+    const predefinedResponses = responses.filter((entry) => entry.source === 'predefined').length;
+    const lastInteraction = responses[responses.length - 1]?.timestamp;
+
+    const lines = [
+        `Here\'s what I have on record for this chat:`,
+        `• Total replies sent: ${total}`,
+        `• AI generated replies: ${openAIResponses}`,
+        `• Memory lookups: ${memoryResponses}`,
+        `• Quick replies: ${predefinedResponses}`
+    ];
+
+    if (lastInteraction) {
+        lines.push(`• Last interaction: ${new Date(lastInteraction).toLocaleString()}`);
+    }
+
+    if (total === 0) {
+        lines.push('No messages have been saved yet. Start chatting and I will keep track.');
+    }
+
+    return lines.join('\n');
+}
+
 function handleCommand(command, chatId) {
     switch (command) {
     case 'help':
@@ -279,6 +407,13 @@ function handleCommand(command, chatId) {
         return 'Our conversation history has been cleared. Feel free to start fresh!';
     case 'history':
         return formatHistorySummary(chatId);
+    case 'policy':
+    case 'safety':
+        return buildPolicyMessage();
+    case 'privacy':
+        return buildPrivacyMessage();
+    case 'stats':
+        return buildStatsMessage(chatId);
     case 'about':
         return `${BOT_NAME} is an AI assistant powered by OpenAI. I can help answer questions and keep the conversation flowing!`;
     default:
@@ -312,67 +447,96 @@ client.on('message', async (message) => {
 
     if (!shouldRespond || !cleanMessage) return;
 
-    if (cleanMessage.startsWith(COMMAND_PREFIX)) {
+    const isCommand = cleanMessage.startsWith(COMMAND_PREFIX);
+
+    if (isCommand) {
         const command = cleanMessage.slice(COMMAND_PREFIX.length).trim().toLowerCase();
         const commandName = command.split(/\s+/)[0];
         const reply = handleCommand(commandName, chatId);
 
-        await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
-        await message.reply(reply);
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        return;
+    }
+
+    if (cleanMessage.length > MAX_MESSAGE_LENGTH) {
+        const reply = `That message is quite long. Please keep it under ${MAX_MESSAGE_LENGTH} characters so I can help effectively.`;
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'safety');
+        return;
+    }
+
+    const sensitiveWarning = checkSensitivePatterns(cleanMessage);
+    if (sensitiveWarning) {
+        await sendWithTyping(message, sensitiveWarning);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, sensitiveWarning, 'safety');
+        return;
+    }
+
+    const inputModeration = await moderateContent(cleanMessage, 'input');
+    if (inputModeration.flagged) {
+        console.warn(`⚠️ Moderation blocked a ${inputModeration.type} message in chat ${chatId}. Categories: ${inputModeration.categories.join(', ') || 'n/a'}`);
+        const reply = SAFE_FAILURE_MESSAGE;
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'safety');
+        return;
+    }
+
+    if (isRateLimited(chatId)) {
+        const reply = 'I\'m wrapping up another request—please try again in a moment.';
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'system');
         return;
     }
 
     // Check predefined replies and stored memory before falling back to OpenAI
     const predefinedReply = getPredefinedReply(cleanMessage);
     let reply = predefinedReply;
-    let usedOpenAI = false;
+    let responseSource = reply ? 'predefined' : null;
 
     if (!reply) {
-        reply = findMemoryAnswer(chatId, cleanMessage);
-        if (reply) {
-            appendToHistory(chatId, { role: 'user', content: cleanMessage });
-            appendToHistory(chatId, { role: 'assistant', content: reply });
-            appendResponse(chatId, {
-                message: cleanMessage,
-                reply,
-                timestamp: new Date().toISOString(),
-                source: 'memory'
-            });
+        const memoryReply = findMemoryAnswer(chatId, cleanMessage);
+        if (memoryReply) {
+            reply = memoryReply;
+            responseSource = 'memory';
         }
     }
 
     if (!reply) {
         reply = await getAIReply(chatId, cleanMessage);
-        usedOpenAI = true;
+        responseSource = 'openai';
     }
 
-    if (reply) {
-        // Typing simulation
-        await new Promise((r) => setTimeout(r, TYPING_DELAY_MS));
-        await message.reply(reply);
+    if (!reply) return;
 
-        // Ensure we record user messages that received an AI lookup but
-        // failed (e.g. empty reply) by syncing memory here
-        if (!usedOpenAI) {
-            // Append again only if we didn't already store the conversation
-            // (predefined replies are stateless, so track them here)
-            const lastTwo = memory[chatId]?.slice(-2) || [];
-            const alreadyStored = lastTwo.some(
-                (entry) => entry?.role === 'assistant' && entry.content === reply
-            );
+    let outputSource = responseSource;
+    const outputModeration = await moderateContent(reply, 'output');
+    if (outputModeration.flagged) {
+        console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+        reply = SAFE_FAILURE_MESSAGE;
+        outputSource = 'safety';
+    }
 
-            if (!alreadyStored) {
-                appendToHistory(chatId, { role: 'user', content: cleanMessage });
-                appendToHistory(chatId, { role: 'assistant', content: reply });
-                appendResponse(chatId, {
-                    message: cleanMessage,
-                    reply,
-                    timestamp: new Date().toISOString(),
-                    source: predefinedReply ? 'predefined' : 'memory'
-                });
-            }
+    await sendWithTyping(message, reply);
+    chatCooldowns.set(chatId, Date.now());
+
+    if (outputSource === 'predefined') {
+        const lastTwo = memory[chatId]?.slice(-2) || [];
+        const alreadyStored = lastTwo.some(
+            (entry) => entry?.role === 'assistant' && entry.content === reply
+        );
+
+        if (!alreadyStored) {
+            recordInteraction(chatId, cleanMessage, reply, outputSource);
         }
+        return;
     }
+
+    recordInteraction(chatId, cleanMessage, reply, outputSource || 'system');
 });
 
 client.initialize();
