@@ -455,8 +455,113 @@ function buildHelpMessage() {
         `${COMMAND_PREFIX}policy - Read how I keep conversations safe`,
         `${COMMAND_PREFIX}privacy - Understand what I store`,
         `${COMMAND_PREFIX}stats - See usage insights for this chat`,
+        `${COMMAND_PREFIX}songs <mood or artist> - Discover tailored music suggestions`,
+        `${COMMAND_PREFIX}plan <goal or situation> - Get a quick day-to-day action plan`,
+        `${COMMAND_PREFIX}meal <ingredients or dietary need> - Receive speedy meal ideas`,
         `${COMMAND_PREFIX}about - Learn more about ${BOT_NAME}`
     ].join('\n');
+}
+
+async function generateTaskResponse({
+    commandName,
+    query,
+    defaultPrompt,
+    instructions,
+    temperature = 0.6
+}) {
+    const trimmedQuery = typeof query === 'string' ? query.trim() : '';
+
+    if (trimmedQuery) {
+        const inputModeration = await moderateContent(trimmedQuery, 'input');
+        if (inputModeration.flagged) {
+            console.warn(`⚠️ Moderation blocked a ${commandName} command. Categories: ${inputModeration.categories.join(', ') || 'n/a'}`);
+            return SAFE_FAILURE_MESSAGE;
+        }
+    }
+
+    const systemContent = [
+        SYSTEM_PROMPT,
+        'Follow these additional instructions when responding to this command:',
+        Array.isArray(instructions) ? instructions.join('\n') : instructions
+    ].join('\n');
+
+    const userPrompt = trimmedQuery || defaultPrompt;
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: systemContent },
+                { role: 'user', content: userPrompt }
+            ],
+            temperature
+        });
+
+        let reply = response.choices?.[0]?.message?.content?.trim();
+        if (!reply) {
+            throw new Error('Empty response from OpenAI');
+        }
+
+        const outputModeration = await moderateContent(reply, 'output');
+        if (outputModeration.flagged) {
+            console.warn(`⚠️ Moderation adjusted a ${commandName} command response. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+            return SAFE_FAILURE_MESSAGE;
+        }
+
+        return reply;
+    } catch (error) {
+        console.error(`Unable to fulfil ${commandName} command:`, error);
+        return 'I had trouble putting that together. Please try again in a moment.';
+    }
+}
+
+function buildCommandInstructions(baseInstructions) {
+    const shared = [
+        '• Keep responses concise and easy to skim.',
+        '• Use bullet points for lists and limit to five items unless fewer make sense.',
+        '• Stay practical and avoid making promises about unavailable services or exact schedules.'
+    ];
+
+    return [...shared, ...baseInstructions].join('\n');
+}
+
+async function buildSongSuggestions(query) {
+    return generateTaskResponse({
+        commandName: 'songs',
+        query,
+        defaultPrompt: 'Suggest a varied list of five widely known songs suitable for general listening.',
+        instructions: buildCommandInstructions([
+            '• Help the user discover music that matches their mood or activity.',
+            '• Format each bullet as “Song – Artist: short vibe description”.',
+            '• Do not mention specific streaming platforms or availability guarantees.'
+        ])
+    });
+}
+
+async function buildDayPlan(query) {
+    return generateTaskResponse({
+        commandName: 'plan',
+        query,
+        defaultPrompt: 'Create a balanced plan for a productive and healthy day for someone with no specific context.',
+        instructions: buildCommandInstructions([
+            '• Offer a short introduction sentence before the list.',
+            '• Provide practical steps that cover work, self-care, and breaks.',
+            '• Tailor the suggestions to the provided details when available.'
+        ])
+    });
+}
+
+async function buildMealIdeas(query) {
+    return generateTaskResponse({
+        commandName: 'meal',
+        query,
+        defaultPrompt: 'Suggest three simple meal ideas that can be prepared quickly with common pantry ingredients.',
+        instructions: buildCommandInstructions([
+            '• Focus on easy-to-find ingredients and straightforward preparation.',
+            '• Include brief cooking tips or substitutions where helpful.',
+            '• Remind the user to adjust for allergies or dietary restrictions if relevant.'
+        ])
+    });
 }
 
 function formatHistorySummary(chatId) {
@@ -599,7 +704,7 @@ async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
     return true;
 }
 
-function handleCommand(command, chatId) {
+async function handleCommand(command, chatId, args = '') {
     switch (command) {
     case 'help':
         return buildHelpMessage();
@@ -624,6 +729,18 @@ function handleCommand(command, chatId) {
         return buildPrivacyMessage();
     case 'stats':
         return buildStatsMessage(chatId);
+    case 'song':
+    case 'songs':
+        return await buildSongSuggestions(args);
+    case 'plan':
+    case 'planner':
+    case 'daily':
+        return await buildDayPlan(args);
+    case 'meal':
+    case 'meals':
+    case 'recipe':
+    case 'recipes':
+        return await buildMealIdeas(args);
     case 'about':
         return `${BOT_NAME} is an AI assistant powered by OpenAI. I can help answer questions and keep the conversation flowing!`;
     default:
@@ -711,9 +828,18 @@ client.on('message', async (message) => {
     const isCommand = cleanMessage.startsWith(COMMAND_PREFIX);
 
     if (isCommand) {
-        const command = cleanMessage.slice(COMMAND_PREFIX.length).trim().toLowerCase();
-        const commandName = command.split(/\s+/)[0];
-        const reply = handleCommand(commandName, chatId);
+        const commandBody = cleanMessage.slice(COMMAND_PREFIX.length).trim();
+        if (!commandBody) {
+            const reply = `Try ${COMMAND_PREFIX}help for a list of available commands.`;
+            await sendWithTyping(message, reply);
+            chatCooldowns.set(chatId, Date.now());
+            return;
+        }
+
+        const [commandNameRaw, ...restParts] = commandBody.split(/\s+/);
+        const commandName = (commandNameRaw || '').toLowerCase();
+        const args = restParts.length > 0 ? commandBody.slice(commandNameRaw.length).trim() : '';
+        const reply = await handleCommand(commandName, chatId, args);
 
         await sendWithTyping(message, reply);
         chatCooldowns.set(chatId, Date.now());
