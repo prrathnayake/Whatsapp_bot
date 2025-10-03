@@ -3,7 +3,26 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const OpenAI = require('openai');
 const fs = require('fs');
-const path = require('path');
+
+const {
+    BOT_NAME,
+    COMMAND_PREFIX,
+    STOPWORDS,
+    SENSITIVE_PATTERNS,
+    SYSTEM_PROMPT,
+    TYPING_DELAY_MS,
+    RATE_LIMIT_MS,
+    MAX_MESSAGE_LENGTH,
+    CONTEXT_LIMIT,
+    MAX_SAVED_HISTORY,
+    MAX_SAVED_RESPONSES,
+    MAX_SAVED_QUICK_REPLIES,
+    SAFE_FAILURE_MESSAGE,
+    PRIVACY_SUMMARY,
+    MEMORY_FILE,
+    RESPONSES_FILE,
+    PUPPETEER_OPTIONS
+} = require('./config');
 
 if (!process.env.OPENAI_API_KEY) {
     throw new Error('Missing OPENAI_API_KEY environment variable. Please configure your .env file.');
@@ -11,54 +30,12 @@ if (!process.env.OPENAI_API_KEY) {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------------- CONFIG ----------------
-const BOT_NAME = 'Emponyoo';
-const TYPING_DELAY_MS = 1500;
-const MEMORY_FILE = path.join(__dirname, 'memory.json');
-const RESPONSES_FILE = path.join(__dirname, 'all_responses.json');
-const CONTEXT_LIMIT = 12; // number of messages (user + assistant) kept in the rolling context
-const MAX_SAVED_HISTORY = 50; // hard cap of messages saved per chat
-const MAX_SAVED_RESPONSES = 100;
-const MAX_SAVED_QUICK_REPLIES = 100; // number of quick replies remembered per chat
-const COMMAND_PREFIX = '!';
-
-const STOPWORDS = new Set([
-    'the', 'and', 'for', 'are', 'but', 'you', 'your', 'with', 'this', 'that', 'have', 'from',
-    'what', 'when', 'where', 'who', 'why', 'how', 'which', 'been', 'were', 'will', 'would',
-    'could', 'should', 'about', 'there', 'here', 'they', 'them', 'their', 'ours', 'ourselves',
-    'him', 'her', 'his', 'hers', 'its', 'our', 'out', 'into', 'onto', 'because', 'been', 'can'
-]);
-
-const SYSTEM_PROMPT = `You are ${BOT_NAME}, a warm, professional, and safety-conscious WhatsApp assistant.
-- Always introduce yourself as ${BOT_NAME} when asked who you are.
-- Keep answers short and conversational (2-4 sentences unless the user explicitly asks for more).
-- If you are unsure about something, be honest and offer to help look it up.
-- Never provide harmful, harassing, or disallowed content. Decline requests for personal, medical, legal, or financial advice and instead offer general guidance.`;
-
-const RATE_LIMIT_MS = 2500; // minimum delay between replies per chat
-const MAX_MESSAGE_LENGTH = 1200; // guard against overly long inputs
-const SENSITIVE_PATTERNS = [
-    {
-        name: 'payment card number',
-        regex: /\b(?:\d[ -]*?){13,19}\b/, // simplistic credit card detector
-        response: 'For your safety, please avoid sharing payment card numbers here. If you need help, try describing the situation without sensitive details.'
-    },
-    {
-        name: 'national ID',
-        regex: /\b\d{3}[- ]?\d{2}[- ]?\d{4}\b/, // SSN-like
-        response: 'I spotted something that looks like a personal identification number. Please keep that private and share only non-sensitive information.'
-    }
-];
-
-const SAFE_FAILURE_MESSAGE = "I'm sorry, but I can't help with that.";
-const PRIVACY_SUMMARY = `${BOT_NAME} stores a limited rolling history per chat to stay helpful. You can clear it any time with ${COMMAND_PREFIX}reset.`;
-
 const chatCooldowns = new Map();
 // ----------------------------------------
 
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { headless: false }
+    puppeteer: PUPPETEER_OPTIONS
 });
 
 // ---------------- MEMORY ----------------
@@ -120,94 +97,6 @@ function isRateLimited(chatId) {
     return false;
 }
 
-const FALLBACK_MEMORY = {
-    chats: {},
-    predefinedResponses: []
-};
-
-let memory = normaliseMemory(readJsonFile(MEMORY_FILE, FALLBACK_MEMORY));
-let allResponses = readJsonFile(RESPONSES_FILE, {});
-
-allResponses = Object.fromEntries(
-    Object.entries(allResponses || {}).map(([chatId, history]) => [
-        chatId,
-        Array.isArray(history) ? history.slice(-MAX_SAVED_RESPONSES) : []
-    ])
-);
-
-function normaliseHistory(history) {
-    if (!Array.isArray(history)) {
-        return [];
-    }
-
-    // Legacy support: previous versions stored plain strings alternating between user & bot.
-    return history
-        .map((entry, index) => {
-            if (typeof entry === 'string') {
-                return {
-                    role: index % 2 === 0 ? 'user' : 'assistant',
-                    content: entry
-                };
-            }
-
-            if (entry && typeof entry === 'object' && entry.content && entry.role) {
-                return { role: entry.role, content: entry.content };
-            }
-
-            return null;
-        })
-        .filter(Boolean)
-        .slice(-MAX_SAVED_HISTORY);
-}
-
-function normaliseQuickReplies(entries) {
-    if (!Array.isArray(entries)) return [];
-
-    return entries
-        .map((entry) => {
-            if (!entry || typeof entry !== 'object') return null;
-
-            const { userMessage, reply, timestamp } = entry;
-            if (!userMessage || !reply) return null;
-
-            return {
-                userMessage,
-                reply,
-                timestamp: timestamp || new Date().toISOString()
-            };
-        })
-        .filter(Boolean)
-        .slice(-MAX_SAVED_QUICK_REPLIES);
-}
-
-function normaliseChatState(chatState) {
-    if (!chatState) {
-        return {
-            history: [],
-            quickReplies: []
-        };
-    }
-
-    if (Array.isArray(chatState)) {
-        return {
-            history: normaliseHistory(chatState),
-            quickReplies: []
-        };
-    }
-
-    if (typeof chatState === 'object') {
-        return {
-            history: normaliseHistory(chatState.history),
-            quickReplies: normaliseQuickReplies(chatState.quickReplies)
-        };
-    }
-
-    return {
-        history: [],
-        quickReplies: []
-    };
-}
-
 function normalisePredefinedEntry(entry) {
     if (!entry || typeof entry !== 'object') return null;
 
@@ -242,92 +131,127 @@ function normalisePredefinedEntry(entry) {
     };
 }
 
+const FALLBACK_MEMORY = { predefinedResponses: [] };
+
+let memory = normaliseMemory(readJsonFile(MEMORY_FILE, FALLBACK_MEMORY));
+let allResponses = normaliseAllResponses(readJsonFile(RESPONSES_FILE, {}));
+const chatCache = new Map();
+
+// Ensure the memory file only contains predefined responses going forward.
+saveMemory();
+
 function normaliseMemory(rawMemory) {
     if (!rawMemory || typeof rawMemory !== 'object' || Array.isArray(rawMemory)) {
-        return {
-            chats: {},
-            predefinedResponses: []
-        };
+        return { predefinedResponses: [] };
     }
-
-    const result = {
-        chats: {},
-        predefinedResponses: []
-    };
 
     const predefinedRaw = Array.isArray(rawMemory.predefinedResponses)
         ? rawMemory.predefinedResponses
         : [];
 
-    result.predefinedResponses = predefinedRaw
-        .map(normalisePredefinedEntry)
-        .filter(Boolean);
+    return {
+        predefinedResponses: predefinedRaw
+            .map(normalisePredefinedEntry)
+            .filter(Boolean)
+    };
+}
 
-    let chatsSource = null;
+function normaliseResponseRecord(record) {
+    if (!record || typeof record !== 'object') return null;
 
-    if (rawMemory.chats && typeof rawMemory.chats === 'object' && !Array.isArray(rawMemory.chats)) {
-        chatsSource = rawMemory.chats;
+    const message = typeof record.message === 'string' ? record.message : '';
+    const reply = typeof record.reply === 'string' ? record.reply : '';
+    const source = typeof record.source === 'string' ? record.source : 'system';
+
+    let timestamp;
+    if (record.timestamp) {
+        const parsed = new Date(record.timestamp);
+        timestamp = Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
     } else {
-        chatsSource = { ...rawMemory };
-        delete chatsSource.predefinedResponses;
-        delete chatsSource.chats;
+        timestamp = new Date().toISOString();
     }
 
-    for (const [chatId, chatState] of Object.entries(chatsSource || {})) {
-        if (!chatId) continue;
-        result.chats[chatId] = normaliseChatState(chatState);
+    if (!message && !reply) return null;
+
+    return {
+        message,
+        reply,
+        source,
+        timestamp
+    };
+}
+
+function normaliseAllResponses(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+
+    const result = {};
+
+    for (const [chatId, entries] of Object.entries(raw)) {
+        if (!chatId || !Array.isArray(entries)) continue;
+
+        result[chatId] = entries
+            .map(normaliseResponseRecord)
+            .filter(Boolean)
+            .slice(-MAX_SAVED_RESPONSES);
     }
 
     return result;
 }
 
-function getChatState(chatId) {
-    if (!memory.chats[chatId]) {
-        memory.chats[chatId] = {
-            history: [],
-            quickReplies: []
-        };
-    } else {
-        memory.chats[chatId] = normaliseChatState(memory.chats[chatId]);
+function hydrateChatState(chatId) {
+    const records = allResponses[chatId] || [];
+    const history = [];
+    const quickReplies = [];
+
+    for (const entry of records) {
+        if (entry.message) {
+            history.push({ role: 'user', content: entry.message });
+        }
+
+        if (entry.reply) {
+            history.push({ role: 'assistant', content: entry.reply });
+        }
+
+        if (entry.source === 'predefined' && entry.reply) {
+            quickReplies.push({
+                userMessage: entry.message || '',
+                reply: entry.reply,
+                timestamp: entry.timestamp
+            });
+        }
     }
 
-    return memory.chats[chatId];
+    return {
+        history: history.slice(-MAX_SAVED_HISTORY),
+        quickReplies: quickReplies.slice(-MAX_SAVED_QUICK_REPLIES)
+    };
+}
+
+function getChatState(chatId) {
+    if (!chatCache.has(chatId)) {
+        chatCache.set(chatId, hydrateChatState(chatId));
+    }
+
+    return chatCache.get(chatId);
 }
 
 // Save memory & responses
 function saveMemory() {
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2));
+    fs.promises.writeFile(
+        MEMORY_FILE,
+        JSON.stringify({ predefinedResponses: memory.predefinedResponses }, null, 2)
+    ).catch((error) => {
+        console.warn(`⚠️ Unable to write ${MEMORY_FILE}`, error);
+    });
 }
 
 function saveAllResponses() {
-    fs.writeFileSync(RESPONSES_FILE, JSON.stringify(allResponses, null, 2));
-}
-
-function appendToHistory(chatId, entry) {
-    const chatState = getChatState(chatId);
-    chatState.history.push(entry);
-
-    if (chatState.history.length > MAX_SAVED_HISTORY) {
-        chatState.history = chatState.history.slice(-MAX_SAVED_HISTORY);
-    }
-
-    saveMemory();
-}
-
-function storeQuickReply(chatId, userMessage, reply) {
-    const chatState = getChatState(chatId);
-
-    chatState.quickReplies.push({
-        userMessage,
-        reply,
-        timestamp: new Date().toISOString()
+    fs.promises.writeFile(
+        RESPONSES_FILE,
+        JSON.stringify(allResponses, null, 2)
+    ).catch((error) => {
+        console.warn(`⚠️ Unable to write ${RESPONSES_FILE}`, error);
     });
-
-    if (chatState.quickReplies.length > MAX_SAVED_QUICK_REPLIES) {
-        chatState.quickReplies = chatState.quickReplies.slice(-MAX_SAVED_QUICK_REPLIES);
-    }
-
-    saveMemory();
 }
 
 function appendResponse(chatId, record) {
@@ -335,7 +259,10 @@ function appendResponse(chatId, record) {
         allResponses[chatId] = [];
     }
 
-    allResponses[chatId].push(record);
+    const normalised = normaliseResponseRecord(record);
+    if (!normalised) return;
+
+    allResponses[chatId].push(normalised);
 
     if (allResponses[chatId].length > MAX_SAVED_RESPONSES) {
         allResponses[chatId] = allResponses[chatId].slice(-MAX_SAVED_RESPONSES);
@@ -345,18 +272,33 @@ function appendResponse(chatId, record) {
 }
 
 function recordInteraction(chatId, userMessage, reply, source = 'system') {
+    const chatState = getChatState(chatId);
+    const timestamp = new Date().toISOString();
+
     if (userMessage) {
-        appendToHistory(chatId, { role: 'user', content: userMessage });
+        chatState.history.push({ role: 'user', content: userMessage });
     }
 
     if (reply) {
-        appendToHistory(chatId, { role: 'assistant', content: reply });
+        chatState.history.push({ role: 'assistant', content: reply });
+    }
+
+    if (chatState.history.length > MAX_SAVED_HISTORY) {
+        chatState.history = chatState.history.slice(-MAX_SAVED_HISTORY);
+    }
+
+    if (source === 'predefined' && userMessage && reply) {
+        chatState.quickReplies.push({ userMessage, reply, timestamp });
+
+        if (chatState.quickReplies.length > MAX_SAVED_QUICK_REPLIES) {
+            chatState.quickReplies = chatState.quickReplies.slice(-MAX_SAVED_QUICK_REPLIES);
+        }
     }
 
     appendResponse(chatId, {
         message: userMessage,
         reply,
-        timestamp: new Date().toISOString(),
+        timestamp,
         source
     });
 }
@@ -583,11 +525,10 @@ function handleCommand(command, chatId) {
     case 'help':
         return buildHelpMessage();
     case 'reset':
-        memory.chats[chatId] = {
+        chatCache.set(chatId, {
             history: [],
             quickReplies: []
-        };
-        saveMemory();
+        });
         if (allResponses[chatId]) {
             delete allResponses[chatId];
             saveAllResponses();
@@ -713,10 +654,6 @@ client.on('message', async (message) => {
 
     await sendWithTyping(message, reply);
     chatCooldowns.set(chatId, Date.now());
-
-    if (outputSource === 'predefined') {
-        storeQuickReply(chatId, cleanMessage, reply);
-    }
 
     recordInteraction(chatId, cleanMessage, reply, outputSource || 'system');
 });
