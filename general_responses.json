@@ -10,5 +10,21 @@
   {
     "keywords": ["congratulations", "congrats"],
     "response": "Congratulations! Sending you all the best vibes."
+  },
+  {
+    "keywords": ["cheer up", "you got this", "motivation"],
+    "response": {
+      "text": "Here's a little boost to brighten your day! 💪",
+      "mediaUrl": "https://www.gstatic.com/webp/gallery/1.jpg",
+      "caption": "Keep going—you're doing great!"
+    }
+  },
+  {
+    "keywords": ["party time", "celebration", "let's party"],
+    "response": {
+      "text": "Party mode activated! 🎉",
+      "stickerUrl": "https://www.gstatic.com/webp/gallery/2.webp",
+      "sendAsSticker": true
+    }
   }
 ]

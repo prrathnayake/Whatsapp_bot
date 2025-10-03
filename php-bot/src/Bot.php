@@ -271,14 +271,35 @@ class Bot
         foreach ($entries as $entry) {
             $keywords = $entry['keywords'] ?? [];
             $response = $entry['response'] ?? null;
-            if (!$keywords || !$response) {
+            if (!$keywords) {
+                continue;
+            }
+
+            $responseText = '';
+            if (is_array($response)) {
+                $text = trim((string)($response['text'] ?? ''));
+                $caption = trim((string)($response['caption'] ?? ''));
+                if ($text !== '') {
+                    $responseText = $text;
+                } elseif ($caption !== '') {
+                    $responseText = $caption;
+                } elseif (!empty($response['stickerUrl'])) {
+                    $responseText = '[sticker]';
+                } elseif (!empty($response['mediaUrl'])) {
+                    $responseText = '[media]';
+                }
+            } elseif (is_string($response)) {
+                $responseText = trim($response);
+            }
+
+            if ($responseText === '') {
                 continue;
             }
 
             foreach ($keywords as $keyword) {
                 $keywordNormalised = mb_strtolower($keyword);
                 if (str_contains($normalised, $keywordNormalised)) {
-                    return $response;
+                    return $responseText;
                 }
             }
         }
