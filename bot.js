@@ -21,6 +21,13 @@ const MAX_SAVED_HISTORY = 50; // hard cap of messages saved per chat
 const MAX_SAVED_RESPONSES = 100;
 const COMMAND_PREFIX = '!';
 
+const STOPWORDS = new Set([
+    'the', 'and', 'for', 'are', 'but', 'you', 'your', 'with', 'this', 'that', 'have', 'from',
+    'what', 'when', 'where', 'who', 'why', 'how', 'which', 'been', 'were', 'will', 'would',
+    'could', 'should', 'about', 'there', 'here', 'they', 'them', 'their', 'ours', 'ourselves',
+    'him', 'her', 'his', 'hers', 'its', 'our', 'out', 'into', 'onto', 'because', 'been', 'can'
+]);
+
 const SYSTEM_PROMPT = `You are ${BOT_NAME}, a warm and professional WhatsApp assistant.
 - Always introduce yourself as ${BOT_NAME} when asked who you are.
 - Keep answers short and conversational (2-4 sentences unless the user explicitly asks for more).
@@ -125,6 +132,55 @@ function appendResponse(chatId, record) {
     }
 
     saveAllResponses();
+}
+
+function extractKeywords(text) {
+    return text
+        .toLowerCase()
+        .replace(/["'`,.!?;:()\[\]{}<>@#%^&*_+=/\\|-]+/g, ' ')
+        .split(/\s+/)
+        .filter((word) => word.length > 2 && !STOPWORDS.has(word));
+}
+
+function findMemoryAnswer(chatId, message) {
+    initChatMemory(chatId);
+
+    const keywords = extractKeywords(message);
+    if (keywords.length === 0) return null;
+
+    const keywordSet = new Set(keywords);
+
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const entry of memory[chatId]) {
+        if (!entry || entry.role !== 'user') continue;
+
+        const entryKeywords = extractKeywords(entry.content);
+        if (entryKeywords.length === 0) continue;
+
+        let overlap = 0;
+        for (const word of entryKeywords) {
+            if (keywordSet.has(word)) overlap += 1;
+        }
+
+        if (overlap === 0) continue;
+
+        const score = overlap / keywordSet.size;
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = entry;
+        }
+    }
+
+    if (!bestMatch) return null;
+
+    // Require a decent overlap for short prompts, looser for longer queries
+    if (keywords.length <= 2 && bestScore < 0.6) return null;
+    if (keywords.length > 2 && bestScore < 0.34) return null;
+
+    return `Earlier you mentioned: "${bestMatch.content}"`;
 }
 
 // ---------------- PREDEFINED REPLIES ----------------
@@ -266,14 +322,56 @@ client.on('message', async (message) => {
         return;
     }
 
-    // Check predefined replies
-    let reply = getPredefinedReply(cleanMessage);
-    if (!reply) reply = await getAIReply(chatId, cleanMessage);
+    // Check predefined replies and stored memory before falling back to OpenAI
+    const predefinedReply = getPredefinedReply(cleanMessage);
+    let reply = predefinedReply;
+    let usedOpenAI = false;
+
+    if (!reply) {
+        reply = findMemoryAnswer(chatId, cleanMessage);
+        if (reply) {
+            appendToHistory(chatId, { role: 'user', content: cleanMessage });
+            appendToHistory(chatId, { role: 'assistant', content: reply });
+            appendResponse(chatId, {
+                message: cleanMessage,
+                reply,
+                timestamp: new Date().toISOString(),
+                source: 'memory'
+            });
+        }
+    }
+
+    if (!reply) {
+        reply = await getAIReply(chatId, cleanMessage);
+        usedOpenAI = true;
+    }
 
     if (reply) {
         // Typing simulation
         await new Promise((r) => setTimeout(r, TYPING_DELAY_MS));
         await message.reply(reply);
+
+        // Ensure we record user messages that received an AI lookup but
+        // failed (e.g. empty reply) by syncing memory here
+        if (!usedOpenAI) {
+            // Append again only if we didn't already store the conversation
+            // (predefined replies are stateless, so track them here)
+            const lastTwo = memory[chatId]?.slice(-2) || [];
+            const alreadyStored = lastTwo.some(
+                (entry) => entry?.role === 'assistant' && entry.content === reply
+            );
+
+            if (!alreadyStored) {
+                appendToHistory(chatId, { role: 'user', content: cleanMessage });
+                appendToHistory(chatId, { role: 'assistant', content: reply });
+                appendResponse(chatId, {
+                    message: cleanMessage,
+                    reply,
+                    timestamp: new Date().toISOString(),
+                    source: predefinedReply ? 'predefined' : 'memory'
+                });
+            }
+        }
     }
 });
 
