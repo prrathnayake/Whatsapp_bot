@@ -4,3 +4,4 @@ node_modules/
 php-bot/vendor/
 php-bot/.env
 php-bot/storage/*.json
+my_*
