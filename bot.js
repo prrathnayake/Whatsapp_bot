@@ -843,13 +843,41 @@ async function requestImageGeneration(chatId, prompt) {
                 return { error: `You have reached the daily image limit of ${usage.limit}. ${waitMessage}`.trim(), usage };
             }
 
-            throw new Error(data?.error || `Image service returned status ${response.status}`);
+            const errorMessage = typeof data?.error === 'string' && data.error.trim()
+                ? data.error.trim()
+                : `Image service returned status ${response.status}`;
+
+            return { error: errorMessage, usage };
         }
 
         return data;
     } catch (error) {
         console.error('Image service error:', error);
-        return { error: 'I couldn\'t create that image right now. Please try again later.' };
+        const fallbackMessage = 'I couldn\'t create that image right now. Please try again later.';
+
+        if (error) {
+            const message = typeof error === 'string' ? error : error?.message;
+            if (message && message.trim()) {
+                const lower = message.toLowerCase();
+                if (
+                    lower.includes('unavailable') ||
+                    lower.includes('timeout') ||
+                    lower.includes('connection')
+                ) {
+                    return { error: message.trim() };
+                }
+            }
+
+            const errorCode = error?.code || error?.cause?.code;
+            if (typeof errorCode === 'string') {
+                const transientCodes = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT']);
+                if (transientCodes.has(errorCode)) {
+                    return { error: 'The image service is currently unavailable. Please try again later.' };
+                }
+            }
+        }
+
+        return { error: fallbackMessage };
     }
 }
 
