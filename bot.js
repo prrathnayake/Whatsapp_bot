@@ -39,6 +39,34 @@ const client = new Client({
     puppeteer: { headless: false }
 });
 
+function formatReplyWithName(text) {
+    const trimmed = (text || '').trim();
+
+    if (!trimmed) {
+        return `${BOT_NAME}:`;
+    }
+
+    const lowerTrimmed = trimmed.toLowerCase();
+    const lowerName = BOT_NAME.toLowerCase();
+
+    if (
+        lowerTrimmed.startsWith(`${lowerName}:`) ||
+        lowerTrimmed.startsWith(`${lowerName},`) ||
+        lowerTrimmed.startsWith(`${lowerName} -`) ||
+        lowerTrimmed.startsWith(`${lowerName} `) ||
+        lowerTrimmed === lowerName
+    ) {
+        return trimmed;
+    }
+
+    return `${BOT_NAME}: ${trimmed}`;
+}
+
+function stripBotNamePrefix(text) {
+    const pattern = new RegExp(`^${BOT_NAME}\\s*[:,-]?\\s*`, 'i');
+    return (text || '').replace(pattern, '').trim();
+}
+
 // ---------------- MEMORY ----------------
 function readJsonFile(filePath, fallback) {
     try {
@@ -222,15 +250,6 @@ async function getAIReply(chatId, message) {
             throw new Error('Empty response from OpenAI');
         }
 
-        appendToHistory(chatId, { role: 'user', content: message });
-        appendToHistory(chatId, { role: 'assistant', content: reply });
-
-        appendResponse(chatId, {
-            message,
-            reply,
-            timestamp: new Date().toISOString()
-        });
-
         return reply;
     } catch (error) {
         console.error('OpenAI error:', error);
@@ -258,8 +277,12 @@ function formatHistorySummary(chatId) {
     }
 
     const lines = lastEntries.map((entry) => {
-        const prefix = entry.role === 'assistant' ? `${BOT_NAME}:` : 'You:';
-        return `${prefix} ${entry.content}`;
+        if (entry.role === 'assistant') {
+            const content = stripBotNamePrefix(entry.content);
+            return `${BOT_NAME}: ${content}`;
+        }
+
+        return `You: ${entry.content}`;
     });
 
     return `Here\'s the latest context I\'m using:\n${lines.join('\n')}`;
@@ -312,10 +335,12 @@ client.on('message', async (message) => {
 
     if (!shouldRespond || !cleanMessage) return;
 
+    initChatMemory(chatId);
+
     if (cleanMessage.startsWith(COMMAND_PREFIX)) {
         const command = cleanMessage.slice(COMMAND_PREFIX.length).trim().toLowerCase();
         const commandName = command.split(/\s+/)[0];
-        const reply = handleCommand(commandName, chatId);
+        const reply = formatReplyWithName(handleCommand(commandName, chatId));
 
         await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
         await message.reply(reply);
@@ -324,54 +349,49 @@ client.on('message', async (message) => {
 
     // Check predefined replies and stored memory before falling back to OpenAI
     const predefinedReply = getPredefinedReply(cleanMessage);
-    let reply = predefinedReply;
-    let usedOpenAI = false;
+    let reply = null;
+    let replySource = null;
 
-    if (!reply) {
-        reply = findMemoryAnswer(chatId, cleanMessage);
-        if (reply) {
-            appendToHistory(chatId, { role: 'user', content: cleanMessage });
-            appendToHistory(chatId, { role: 'assistant', content: reply });
-            appendResponse(chatId, {
-                message: cleanMessage,
-                reply,
-                timestamp: new Date().toISOString(),
-                source: 'memory'
-            });
+    if (predefinedReply) {
+        reply = predefinedReply;
+        replySource = 'predefined';
+    } else {
+        const memoryReply = findMemoryAnswer(chatId, cleanMessage);
+        if (memoryReply) {
+            reply = memoryReply;
+            replySource = 'memory';
         }
     }
 
     if (!reply) {
         reply = await getAIReply(chatId, cleanMessage);
-        usedOpenAI = true;
+        replySource = 'openai';
     }
 
-    if (reply) {
-        // Typing simulation
-        await new Promise((r) => setTimeout(r, TYPING_DELAY_MS));
-        await message.reply(reply);
+    if (!reply) return;
 
-        // Ensure we record user messages that received an AI lookup but
-        // failed (e.g. empty reply) by syncing memory here
-        if (!usedOpenAI) {
-            // Append again only if we didn't already store the conversation
-            // (predefined replies are stateless, so track them here)
-            const lastTwo = memory[chatId]?.slice(-2) || [];
-            const alreadyStored = lastTwo.some(
-                (entry) => entry?.role === 'assistant' && entry.content === reply
-            );
+    const formattedReply = formatReplyWithName(reply);
+    const assistantContent = stripBotNamePrefix(formattedReply);
 
-            if (!alreadyStored) {
-                appendToHistory(chatId, { role: 'user', content: cleanMessage });
-                appendToHistory(chatId, { role: 'assistant', content: reply });
-                appendResponse(chatId, {
-                    message: cleanMessage,
-                    reply,
-                    timestamp: new Date().toISOString(),
-                    source: predefinedReply ? 'predefined' : 'memory'
-                });
-            }
-        }
+    // Typing simulation
+    await new Promise((r) => setTimeout(r, TYPING_DELAY_MS));
+    await message.reply(formattedReply);
+
+    const lastTwo = memory[chatId]?.slice(-2) || [];
+    const alreadyStored = lastTwo.some(
+        (entry) => entry?.role === 'assistant' && entry.content === assistantContent
+    );
+    const shouldStore = replySource === 'openai' || !alreadyStored;
+
+    if (shouldStore) {
+        appendToHistory(chatId, { role: 'user', content: cleanMessage });
+        appendToHistory(chatId, { role: 'assistant', content: assistantContent });
+        appendResponse(chatId, {
+            message: cleanMessage,
+            reply: formattedReply,
+            timestamp: new Date().toISOString(),
+            source: replySource
+        });
     }
 });
 
