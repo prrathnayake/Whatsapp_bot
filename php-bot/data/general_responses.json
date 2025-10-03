@@ -1,0 +1,14 @@
+[
+  {
+    "keywords": ["good morning", "morning everyone"],
+    "response": "Good morning! Wishing everyone a fantastic day ahead."
+  },
+  {
+    "keywords": ["good night", "night all"],
+    "response": "Good night! Rest well and talk to you soon."
+  },
+  {
+    "keywords": ["congratulations", "congrats"],
+    "response": "Congratulations! Sending you all the best vibes."
+  }
+]

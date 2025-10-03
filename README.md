@@ -29,6 +29,10 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
    ```
 4. Scan the displayed QR code in WhatsApp to authorise the session.
 
+### Deploying the PHP edition
+
+If you need to stay on PHP-only hosting, use the rewritten bot in [`php-bot/`](./php-bot/README.md). It integrates with the official WhatsApp Cloud API instead of Puppeteer and can be deployed as a standard PHP webhook. Follow the README in that folder for composer installation, webhook verification, and environment variables.
+
 ## Commands
 
 | Command    | Description |

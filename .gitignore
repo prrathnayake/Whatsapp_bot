@@ -1,3 +1,6 @@
 .env
-node_modules/*
-.wwebjs*
+node_modules/
+.wwebjs_auth/
+php-bot/vendor/
+php-bot/.env
+php-bot/storage/*.json
