@@ -5,7 +5,7 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 ## Features
 
 - 🤖 Conversational AI responses backed by `gpt-4o-mini` with configurable system prompt
-- 💬 Rolling context memory per chat (persisted to disk with auto-trimming)
+- 💬 Rolling context memory per chat backed by a lightweight on-disk log
 - 🧠 Memory-first answers for facts you previously shared before asking OpenAI
 - ⚙️ Built-in bot commands (`!help`, `!reset`, `!history`, `!policy`, `!privacy`, `!stats`, `!about`)
 - 🙋‍♂️ Friendly predefined replies for common greetings and sentiments
@@ -44,10 +44,16 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 
 ## Data Files
 
-- `memory.json`: per-chat rolling conversation history and remembered quick replies
-- `all_responses.json`: log of user prompts and bot replies (trimmed to the most recent 100 entries per chat)
+- `memory.json`: curated list of predefined responses that the bot can answer instantly
+- `all_responses.json`: rolling log of user prompts and bot replies (trimmed to the most recent 100 entries per chat)
 
-Both files are written relative to `bot.js`. They are automatically created when the bot first runs.
+Both files are written relative to `bot.js`. Configuration values (bot name, limits, etc.) live in `config.js` so you can tweak behaviour without editing the main bot file.
+
+## Legal
+
+- [MIT License](./LICENSE)
+- [Privacy Policy](./PRIVACY_POLICY.md)
+- [Terms of Service](./TERMS_OF_SERVICE.md)
 
 ## Development Notes
 
