@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const OpenAI = require('openai');
 const fs = require('fs');
@@ -99,11 +99,81 @@ function isRateLimited(chatId) {
     return false;
 }
 
-function normalisePredefinedEntry(entry) {
+function normaliseResponsePayload(entry) {
     if (!entry || typeof entry !== 'object') return null;
 
-    const response = typeof entry.response === 'string' ? entry.response.trim() : '';
-    if (!response) return null;
+    const rawResponse = entry.response;
+
+    let text = '';
+    let caption = '';
+    let mediaUrl = '';
+    let stickerUrl = '';
+    let sendAsSticker = false;
+
+    if (typeof rawResponse === 'string') {
+        text = rawResponse.trim();
+    } else if (rawResponse && typeof rawResponse === 'object') {
+        if (typeof rawResponse.text === 'string') {
+            text = rawResponse.text.trim();
+        }
+
+        if (typeof rawResponse.caption === 'string') {
+            caption = rawResponse.caption.trim();
+        }
+
+        if (typeof rawResponse.mediaUrl === 'string') {
+            mediaUrl = rawResponse.mediaUrl.trim();
+        }
+
+        if (typeof rawResponse.stickerUrl === 'string') {
+            stickerUrl = rawResponse.stickerUrl.trim();
+        }
+
+        if (typeof rawResponse.sendAsSticker === 'boolean') {
+            sendAsSticker = rawResponse.sendAsSticker;
+        }
+    }
+
+    if (!mediaUrl && typeof entry.mediaUrl === 'string') {
+        mediaUrl = entry.mediaUrl.trim();
+    }
+
+    if (!stickerUrl && typeof entry.stickerUrl === 'string') {
+        stickerUrl = entry.stickerUrl.trim();
+    }
+
+    if (!caption && typeof entry.caption === 'string') {
+        caption = entry.caption.trim();
+    }
+
+    if (typeof entry.sendAsSticker === 'boolean') {
+        sendAsSticker = entry.sendAsSticker;
+    }
+
+    if (stickerUrl && typeof rawResponse?.sendAsSticker === 'undefined' && typeof entry.sendAsSticker === 'undefined') {
+        sendAsSticker = true;
+    }
+
+    const hasText = typeof text === 'string' && text.trim().length > 0;
+    const hasCaption = typeof caption === 'string' && caption.trim().length > 0;
+    const hasMedia = typeof mediaUrl === 'string' && mediaUrl.length > 0;
+    const hasSticker = typeof stickerUrl === 'string' && stickerUrl.length > 0;
+
+    if (!hasText && !hasCaption && !hasMedia && !hasSticker) {
+        return null;
+    }
+
+    return {
+        text: hasText ? text : '',
+        caption: hasCaption ? caption : '',
+        mediaUrl: hasMedia ? mediaUrl : '',
+        stickerUrl: hasSticker ? stickerUrl : '',
+        sendAsSticker: Boolean(sendAsSticker)
+    };
+}
+
+function normalisePredefinedEntry(entry) {
+    if (!entry || typeof entry !== 'object') return null;
 
     let keywords = entry.keywords ?? entry.triggers ?? entry.patterns ?? entry.match ?? entry.phrases;
 
@@ -125,6 +195,9 @@ function normalisePredefinedEntry(entry) {
         .filter(Boolean);
 
     if (normalisedKeywords.length === 0) return null;
+
+    const response = normaliseResponsePayload(entry);
+    if (!response) return null;
 
     return {
         keywords: normalisedKeywords,
@@ -315,9 +388,84 @@ function recordInteraction(chatId, userMessage, reply, source = 'system') {
     });
 }
 
-async function sendWithTyping(message, text) {
+function getResponseText(response) {
+    if (!response) return '';
+
+    if (typeof response === 'string') {
+        return response;
+    }
+
+    if (typeof response.text === 'string' && response.text.trim().length > 0) {
+        return response.text.trim();
+    }
+
+    if (typeof response.caption === 'string' && response.caption.trim().length > 0) {
+        return response.caption.trim();
+    }
+
+    return '';
+}
+
+function describeResponseForLog(response) {
+    const text = getResponseText(response);
+    if (text) return text;
+
+    if (response && typeof response === 'object') {
+        if (response.stickerUrl || response.sendAsSticker) {
+            return '[sticker]';
+        }
+
+        if (response.mediaUrl) {
+            return '[media]';
+        }
+    }
+
+    return '[response]';
+}
+
+async function sendWithTyping(message, response) {
     await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
-    await message.reply(text);
+
+    if (!response) {
+        await message.reply(SAFE_FAILURE_MESSAGE);
+        return;
+    }
+
+    if (typeof response === 'string') {
+        await message.reply(response);
+        return;
+    }
+
+    const { text, caption, mediaUrl, stickerUrl, sendAsSticker } = response;
+    const captionToUse = text || caption || undefined;
+
+    if ((stickerUrl || sendAsSticker) && (stickerUrl || mediaUrl)) {
+        const stickerSource = stickerUrl || mediaUrl;
+
+        try {
+            const media = await MessageMedia.fromUrl(stickerSource, { unsafeMime: true });
+            await message.reply(media, undefined, { sendMediaAsSticker: true });
+            if (captionToUse) {
+                await message.reply(captionToUse);
+            }
+            return;
+        } catch (error) {
+            console.warn('⚠️ Failed to send sticker media. Falling back to alternative content.', error);
+        }
+    }
+
+    if (mediaUrl) {
+        try {
+            const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+            await message.reply(media, undefined, captionToUse ? { caption: captionToUse } : undefined);
+            return;
+        } catch (error) {
+            console.warn('⚠️ Failed to send media response. Falling back to text.', error);
+        }
+    }
+
+    const fallbackText = captionToUse || SAFE_FAILURE_MESSAGE;
+    await message.reply(fallbackText);
 }
 
 function extractKeywords(text) {
@@ -370,6 +518,23 @@ function findMemoryAnswer(chatId, message) {
 }
 
 // ---------------- PREDEFINED REPLIES ----------------
+function hasResponseContent(response) {
+    if (!response) return false;
+
+    if (typeof response === 'string') {
+        return response.trim().length > 0;
+    }
+
+    if (typeof response !== 'object') return false;
+
+    return (
+        (typeof response.text === 'string' && response.text.trim().length > 0) ||
+        (typeof response.caption === 'string' && response.caption.trim().length > 0) ||
+        (typeof response.mediaUrl === 'string' && response.mediaUrl.trim().length > 0) ||
+        (typeof response.stickerUrl === 'string' && response.stickerUrl.trim().length > 0)
+    );
+}
+
 function findKeywordResponse(text, entries) {
     if (!text || !Array.isArray(entries) || entries.length === 0) return null;
 
@@ -382,7 +547,7 @@ function findKeywordResponse(text, entries) {
         if (keywords.length === 0) continue;
 
         const response = entry.response;
-        if (!response) continue;
+        if (!hasResponseContent(response)) continue;
 
         const caseSensitive = Boolean(entry.caseSensitive);
 
@@ -397,6 +562,10 @@ function findKeywordResponse(text, entries) {
         });
 
         if (matchFound) {
+            if (typeof response === 'string') {
+                return { text: response };
+            }
+
             return response;
         }
     }
@@ -650,8 +819,8 @@ async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
     if (!cleanMessage || !chatId.endsWith('@g.us')) return false;
     if (cleanMessage.startsWith(COMMAND_PREFIX)) return false;
 
-    const generalReply = getGeneralReply(cleanMessage);
-    if (!generalReply) return false;
+    const generalResponse = getGeneralReply(cleanMessage);
+    if (!generalResponse) return false;
 
     if (cleanMessage.length > MAX_MESSAGE_LENGTH) {
         const reply = buildLengthWarning();
@@ -687,19 +856,25 @@ async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
         return true;
     }
 
-    let reply = generalReply;
+    let replyPayload = generalResponse;
     let outputSource = 'general';
 
-    const outputModeration = await moderateContent(reply, 'output');
+    const moderationTarget = getResponseText(replyPayload);
+    const outputModeration = await moderateContent(moderationTarget, 'output');
     if (outputModeration.flagged) {
         console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
-        reply = SAFE_FAILURE_MESSAGE;
+        replyPayload = SAFE_FAILURE_MESSAGE;
         outputSource = 'safety';
     }
 
-    await sendWithTyping(message, reply);
+    await sendWithTyping(message, replyPayload);
     chatCooldowns.set(chatId, Date.now());
-    recordInteraction(chatId, cleanMessage, reply, outputSource);
+    recordInteraction(
+        chatId,
+        cleanMessage,
+        typeof replyPayload === 'string' ? replyPayload : describeResponseForLog(replyPayload),
+        outputSource
+    );
 
     return true;
 }
@@ -882,36 +1057,42 @@ client.on('message', async (message) => {
 
     // Check predefined replies and stored memory before falling back to OpenAI
     const predefinedReply = getPredefinedReply(cleanMessage);
-    let reply = predefinedReply;
-    let responseSource = reply ? 'predefined' : null;
+    let replyPayload = predefinedReply;
+    let responseSource = replyPayload ? 'predefined' : null;
 
-    if (!reply) {
+    if (!replyPayload) {
         const memoryReply = findMemoryAnswer(chatId, cleanMessage);
         if (memoryReply) {
-            reply = memoryReply;
+            replyPayload = memoryReply;
             responseSource = 'memory';
         }
     }
 
-    if (!reply) {
-        reply = await getAIReply(chatId, cleanMessage);
+    if (!replyPayload) {
+        replyPayload = await getAIReply(chatId, cleanMessage);
         responseSource = 'openai';
     }
 
-    if (!reply) return;
+    if (!replyPayload) return;
 
     let outputSource = responseSource;
-    const outputModeration = await moderateContent(reply, 'output');
+    const moderationTarget = typeof replyPayload === 'string' ? replyPayload : getResponseText(replyPayload);
+    const outputModeration = await moderateContent(moderationTarget, 'output');
     if (outputModeration.flagged) {
         console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
-        reply = SAFE_FAILURE_MESSAGE;
+        replyPayload = SAFE_FAILURE_MESSAGE;
         outputSource = 'safety';
     }
 
-    await sendWithTyping(message, reply);
+    await sendWithTyping(message, replyPayload);
     chatCooldowns.set(chatId, Date.now());
 
-    recordInteraction(chatId, cleanMessage, reply, outputSource || 'system');
+    recordInteraction(
+        chatId,
+        cleanMessage,
+        typeof replyPayload === 'string' ? replyPayload : describeResponseForLog(replyPayload),
+        outputSource || 'system'
+    );
 });
 
 client.initialize();
