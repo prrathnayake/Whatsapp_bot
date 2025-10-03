@@ -40,6 +40,7 @@ const config = {
     PRIVACY_SUMMARY: `${BOT_NAME} stores a limited rolling history per chat to stay helpful. You can clear it any time with ${COMMAND_PREFIX}reset.`,
     MEMORY_FILE: path.join(__dirname, 'memory.json'),
     RESPONSES_FILE: path.join(__dirname, 'all_responses.json'),
+    GENERAL_RESPONSES_FILE: path.join(__dirname, 'general_responses.json'),
     PUPPETEER_OPTIONS: { headless: false }
 };
 

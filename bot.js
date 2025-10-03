@@ -21,6 +21,7 @@ const {
     PRIVACY_SUMMARY,
     MEMORY_FILE,
     RESPONSES_FILE,
+    GENERAL_RESPONSES_FILE,
     PUPPETEER_OPTIONS
 } = require('./config');
 
@@ -133,9 +134,11 @@ function normalisePredefinedEntry(entry) {
 }
 
 const FALLBACK_MEMORY = { predefinedResponses: [] };
+const FALLBACK_GENERAL_RESPONSES = [];
 
 let memory = normaliseMemory(readJsonFile(MEMORY_FILE, FALLBACK_MEMORY));
 let allResponses = normaliseAllResponses(readJsonFile(RESPONSES_FILE, {}));
+let generalResponses = normaliseGeneralResponses(readJsonFile(GENERAL_RESPONSES_FILE, FALLBACK_GENERAL_RESPONSES));
 const chatCache = new Map();
 
 // Ensure the memory file only contains predefined responses going forward.
@@ -155,6 +158,14 @@ function normaliseMemory(rawMemory) {
             .map(normalisePredefinedEntry)
             .filter(Boolean)
     };
+}
+
+function normaliseGeneralResponses(raw) {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+        .map(normalisePredefinedEntry)
+        .filter(Boolean);
 }
 
 function normaliseResponseRecord(record) {
@@ -359,15 +370,12 @@ function findMemoryAnswer(chatId, message) {
 }
 
 // ---------------- PREDEFINED REPLIES ----------------
-function getPredefinedReply(text) {
-    if (!text) return null;
-
-    const predefinedEntries = memory.predefinedResponses || [];
-    if (predefinedEntries.length === 0) return null;
+function findKeywordResponse(text, entries) {
+    if (!text || !Array.isArray(entries) || entries.length === 0) return null;
 
     const lowerCased = text.toLowerCase();
 
-    for (const entry of predefinedEntries) {
+    for (const entry of entries) {
         if (!entry) continue;
 
         const keywords = Array.isArray(entry.keywords) ? entry.keywords : [];
@@ -394,6 +402,14 @@ function getPredefinedReply(text) {
     }
 
     return null;
+}
+
+function getPredefinedReply(text) {
+    return findKeywordResponse(text, memory.predefinedResponses || []);
+}
+
+function getGeneralReply(text) {
+    return findKeywordResponse(text, generalResponses);
 }
 
 // ---------------- AI REPLY ----------------
@@ -521,6 +537,68 @@ function buildQuickRepliesMessage(chatId) {
     return [`Here are the quick replies I\'ve used in this chat:`, ...lines].join('\n');
 }
 
+function buildLengthWarning() {
+    return `That message is quite long. Please keep it under ${MAX_MESSAGE_LENGTH} characters so I can help effectively.`;
+}
+
+async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
+    if (!cleanMessage || !chatId.endsWith('@g.us')) return false;
+    if (cleanMessage.startsWith(COMMAND_PREFIX)) return false;
+
+    const generalReply = getGeneralReply(cleanMessage);
+    if (!generalReply) return false;
+
+    if (cleanMessage.length > MAX_MESSAGE_LENGTH) {
+        const reply = buildLengthWarning();
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'safety');
+        return true;
+    }
+
+    const sensitiveWarning = checkSensitivePatterns(cleanMessage);
+    if (sensitiveWarning) {
+        await sendWithTyping(message, sensitiveWarning);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, sensitiveWarning, 'safety');
+        return true;
+    }
+
+    const inputModeration = await moderateContent(cleanMessage, 'input');
+    if (inputModeration.flagged) {
+        console.warn(`⚠️ Moderation blocked a ${inputModeration.type} message in chat ${chatId}. Categories: ${inputModeration.categories.join(', ') || 'n/a'}`);
+        const reply = SAFE_FAILURE_MESSAGE;
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'safety');
+        return true;
+    }
+
+    if (isRateLimited(chatId)) {
+        const reply = 'I\'m wrapping up another request—please try again in a moment.';
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'system');
+        return true;
+    }
+
+    let reply = generalReply;
+    let outputSource = 'general';
+
+    const outputModeration = await moderateContent(reply, 'output');
+    if (outputModeration.flagged) {
+        console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+        reply = SAFE_FAILURE_MESSAGE;
+        outputSource = 'safety';
+    }
+
+    await sendWithTyping(message, reply);
+    chatCooldowns.set(chatId, Date.now());
+    recordInteraction(chatId, cleanMessage, reply, outputSource);
+
+    return true;
+}
+
 function handleCommand(command, chatId) {
     switch (command) {
     case 'help':
@@ -624,6 +702,10 @@ client.on('message', async (message) => {
         }
     }
 
+    if (await tryHandleGeneralMessage(message, cleanMessage, chatId)) {
+        return;
+    }
+
     if (!shouldRespond || !cleanMessage) return;
 
     const isCommand = cleanMessage.startsWith(COMMAND_PREFIX);
@@ -639,7 +721,7 @@ client.on('message', async (message) => {
     }
 
     if (cleanMessage.length > MAX_MESSAGE_LENGTH) {
-        const reply = `That message is quite long. Please keep it under ${MAX_MESSAGE_LENGTH} characters so I can help effectively.`;
+        const reply = buildLengthWarning();
         await sendWithTyping(message, reply);
         chatCooldowns.set(chatId, Date.now());
         recordInteraction(chatId, cleanMessage, reply, 'safety');
