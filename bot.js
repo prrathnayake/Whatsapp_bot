@@ -120,12 +120,13 @@ function isRateLimited(chatId) {
     return false;
 }
 
-let memory = readJsonFile(MEMORY_FILE, {});
-let allResponses = readJsonFile(RESPONSES_FILE, {});
+const FALLBACK_MEMORY = {
+    chats: {},
+    predefinedResponses: []
+};
 
-memory = Object.fromEntries(
-    Object.entries(memory || {}).map(([chatId, chatState]) => [chatId, normaliseChatState(chatState)])
-);
+let memory = normaliseMemory(readJsonFile(MEMORY_FILE, FALLBACK_MEMORY));
+let allResponses = readJsonFile(RESPONSES_FILE, {});
 
 allResponses = Object.fromEntries(
     Object.entries(allResponses || {}).map(([chatId, history]) => [
@@ -207,17 +208,90 @@ function normaliseChatState(chatState) {
     };
 }
 
+function normalisePredefinedEntry(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+
+    const response = typeof entry.response === 'string' ? entry.response.trim() : '';
+    if (!response) return null;
+
+    let keywords = entry.keywords ?? entry.triggers ?? entry.patterns ?? entry.match ?? entry.phrases;
+
+    const caseSensitive = Boolean(entry.caseSensitive);
+
+    if (typeof keywords === 'string') {
+        keywords = [keywords];
+    }
+
+    if (!Array.isArray(keywords)) return null;
+
+    const normalisedKeywords = keywords
+        .map((keyword) => {
+            if (typeof keyword !== 'string') return null;
+            const trimmed = keyword.trim();
+            if (!trimmed) return null;
+            return caseSensitive ? trimmed : trimmed.toLowerCase();
+        })
+        .filter(Boolean);
+
+    if (normalisedKeywords.length === 0) return null;
+
+    return {
+        keywords: normalisedKeywords,
+        response,
+        caseSensitive
+    };
+}
+
+function normaliseMemory(rawMemory) {
+    if (!rawMemory || typeof rawMemory !== 'object' || Array.isArray(rawMemory)) {
+        return {
+            chats: {},
+            predefinedResponses: []
+        };
+    }
+
+    const result = {
+        chats: {},
+        predefinedResponses: []
+    };
+
+    const predefinedRaw = Array.isArray(rawMemory.predefinedResponses)
+        ? rawMemory.predefinedResponses
+        : [];
+
+    result.predefinedResponses = predefinedRaw
+        .map(normalisePredefinedEntry)
+        .filter(Boolean);
+
+    let chatsSource = null;
+
+    if (rawMemory.chats && typeof rawMemory.chats === 'object' && !Array.isArray(rawMemory.chats)) {
+        chatsSource = rawMemory.chats;
+    } else {
+        chatsSource = { ...rawMemory };
+        delete chatsSource.predefinedResponses;
+        delete chatsSource.chats;
+    }
+
+    for (const [chatId, chatState] of Object.entries(chatsSource || {})) {
+        if (!chatId) continue;
+        result.chats[chatId] = normaliseChatState(chatState);
+    }
+
+    return result;
+}
+
 function getChatState(chatId) {
-    if (!memory[chatId]) {
-        memory[chatId] = {
+    if (!memory.chats[chatId]) {
+        memory.chats[chatId] = {
             history: [],
             quickReplies: []
         };
     } else {
-        memory[chatId] = normaliseChatState(memory[chatId]);
+        memory.chats[chatId] = normaliseChatState(memory.chats[chatId]);
     }
 
-    return memory[chatId];
+    return memory.chats[chatId];
 }
 
 // Save memory & responses
@@ -343,14 +417,38 @@ function findMemoryAnswer(chatId, message) {
 
 // ---------------- PREDEFINED REPLIES ----------------
 function getPredefinedReply(text) {
-    const normalised = text.toLowerCase();
+    if (!text) return null;
 
-    if (normalised.includes('hello') || normalised.includes('hi')) return 'Hello! 👋';
-    if (normalised.includes('how are you')) return "I\'m just a bot, but I\'m doing great! 😄";
-    if (normalised.includes('good morning')) return 'Good morning! ☀️';
-    if (normalised.includes('good night')) return 'Good night! 🌙';
-    if (normalised.includes('thanks') || normalised.includes('thank you')) return "You\'re welcome! 😊";
-    if (normalised.includes('bye') || normalised.includes('goodbye')) return 'Goodbye! 👋';
+    const predefinedEntries = memory.predefinedResponses || [];
+    if (predefinedEntries.length === 0) return null;
+
+    const lowerCased = text.toLowerCase();
+
+    for (const entry of predefinedEntries) {
+        if (!entry) continue;
+
+        const keywords = Array.isArray(entry.keywords) ? entry.keywords : [];
+        if (keywords.length === 0) continue;
+
+        const response = entry.response;
+        if (!response) continue;
+
+        const caseSensitive = Boolean(entry.caseSensitive);
+
+        const matchFound = keywords.some((keyword) => {
+            if (typeof keyword !== 'string' || keyword.trim().length === 0) return false;
+
+            if (caseSensitive) {
+                return text.includes(keyword);
+            }
+
+            return lowerCased.includes(keyword.toLowerCase());
+        });
+
+        if (matchFound) {
+            return response;
+        }
+    }
 
     return null;
 }
@@ -485,7 +583,7 @@ function handleCommand(command, chatId) {
     case 'help':
         return buildHelpMessage();
     case 'reset':
-        memory[chatId] = {
+        memory.chats[chatId] = {
             history: [],
             quickReplies: []
         };

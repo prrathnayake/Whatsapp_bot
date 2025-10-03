@@ -1,1 +1,25 @@
-{}
+{
+  "predefinedResponses": [
+    {
+      "keywords": ["hello", "hi", "hey"],
+      "response": "Hello! 👋 How can I assist you today?"
+    },
+    {
+      "keywords": ["good morning", "morning"],
+      "response": "Good morning! ☀️ Hope your day is going well."
+    },
+    {
+      "keywords": ["thank you", "thanks", "thx"],
+      "response": "You're welcome! 😊 Let me know if you need anything else."
+    },
+    {
+      "keywords": ["bye", "goodbye", "see you"],
+      "response": "Goodbye! 👋 Catch you later."
+    },
+    {
+      "keywords": ["who are you", "what is your name"],
+      "response": "I'm Emponyoo, your friendly WhatsApp assistant powered by OpenAI."
+    }
+  ],
+  "chats": {}
+}
