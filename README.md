@@ -36,6 +36,7 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 | `!help`    | Show available commands |
 | `!reset`   | Clear the saved conversation context for the chat |
 | `!history` | Summarise the most recent context that informs replies |
+| `!quickreplies` | List the quick replies the bot has used in this chat |
 | `!policy`  | Display the assistant's safety guidelines |
 | `!privacy` | Explain what data is stored and how to clear it |
 | `!stats`   | Share usage insights for the current chat |
@@ -43,7 +44,7 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 
 ## Data Files
 
-- `memory.json`: per-chat rolling conversation history
+- `memory.json`: per-chat rolling conversation history and remembered quick replies
 - `all_responses.json`: log of user prompts and bot replies (trimmed to the most recent 100 entries per chat)
 
 Both files are written relative to `bot.js`. They are automatically created when the bot first runs.

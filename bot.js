@@ -19,6 +19,7 @@ const RESPONSES_FILE = path.join(__dirname, 'all_responses.json');
 const CONTEXT_LIMIT = 12; // number of messages (user + assistant) kept in the rolling context
 const MAX_SAVED_HISTORY = 50; // hard cap of messages saved per chat
 const MAX_SAVED_RESPONSES = 100;
+const MAX_SAVED_QUICK_REPLIES = 100; // number of quick replies remembered per chat
 const COMMAND_PREFIX = '!';
 
 const STOPWORDS = new Set([
@@ -123,7 +124,7 @@ let memory = readJsonFile(MEMORY_FILE, {});
 let allResponses = readJsonFile(RESPONSES_FILE, {});
 
 memory = Object.fromEntries(
-    Object.entries(memory || {}).map(([chatId, history]) => [chatId, normaliseHistory(history)])
+    Object.entries(memory || {}).map(([chatId, chatState]) => [chatId, normaliseChatState(chatState)])
 );
 
 allResponses = Object.fromEntries(
@@ -158,14 +159,65 @@ function normaliseHistory(history) {
         .slice(-MAX_SAVED_HISTORY);
 }
 
-// Ensure memory for each chat
-function initChatMemory(chatId) {
-    if (!memory[chatId]) {
-        memory[chatId] = [];
-        return;
+function normaliseQuickReplies(entries) {
+    if (!Array.isArray(entries)) return [];
+
+    return entries
+        .map((entry) => {
+            if (!entry || typeof entry !== 'object') return null;
+
+            const { userMessage, reply, timestamp } = entry;
+            if (!userMessage || !reply) return null;
+
+            return {
+                userMessage,
+                reply,
+                timestamp: timestamp || new Date().toISOString()
+            };
+        })
+        .filter(Boolean)
+        .slice(-MAX_SAVED_QUICK_REPLIES);
+}
+
+function normaliseChatState(chatState) {
+    if (!chatState) {
+        return {
+            history: [],
+            quickReplies: []
+        };
     }
 
-    memory[chatId] = normaliseHistory(memory[chatId]);
+    if (Array.isArray(chatState)) {
+        return {
+            history: normaliseHistory(chatState),
+            quickReplies: []
+        };
+    }
+
+    if (typeof chatState === 'object') {
+        return {
+            history: normaliseHistory(chatState.history),
+            quickReplies: normaliseQuickReplies(chatState.quickReplies)
+        };
+    }
+
+    return {
+        history: [],
+        quickReplies: []
+    };
+}
+
+function getChatState(chatId) {
+    if (!memory[chatId]) {
+        memory[chatId] = {
+            history: [],
+            quickReplies: []
+        };
+    } else {
+        memory[chatId] = normaliseChatState(memory[chatId]);
+    }
+
+    return memory[chatId];
 }
 
 // Save memory & responses
@@ -178,11 +230,27 @@ function saveAllResponses() {
 }
 
 function appendToHistory(chatId, entry) {
-    initChatMemory(chatId);
-    memory[chatId].push(entry);
+    const chatState = getChatState(chatId);
+    chatState.history.push(entry);
 
-    if (memory[chatId].length > MAX_SAVED_HISTORY) {
-        memory[chatId] = memory[chatId].slice(-MAX_SAVED_HISTORY);
+    if (chatState.history.length > MAX_SAVED_HISTORY) {
+        chatState.history = chatState.history.slice(-MAX_SAVED_HISTORY);
+    }
+
+    saveMemory();
+}
+
+function storeQuickReply(chatId, userMessage, reply) {
+    const chatState = getChatState(chatId);
+
+    chatState.quickReplies.push({
+        userMessage,
+        reply,
+        timestamp: new Date().toISOString()
+    });
+
+    if (chatState.quickReplies.length > MAX_SAVED_QUICK_REPLIES) {
+        chatState.quickReplies = chatState.quickReplies.slice(-MAX_SAVED_QUICK_REPLIES);
     }
 
     saveMemory();
@@ -233,7 +301,7 @@ function extractKeywords(text) {
 }
 
 function findMemoryAnswer(chatId, message) {
-    initChatMemory(chatId);
+    const chatState = getChatState(chatId);
 
     const keywords = extractKeywords(message);
     if (keywords.length === 0) return null;
@@ -243,7 +311,7 @@ function findMemoryAnswer(chatId, message) {
     let bestMatch = null;
     let bestScore = 0;
 
-    for (const entry of memory[chatId]) {
+    for (const entry of chatState.history) {
         if (!entry || entry.role !== 'user') continue;
 
         const entryKeywords = extractKeywords(entry.content);
@@ -289,10 +357,10 @@ function getPredefinedReply(text) {
 
 // ---------------- AI REPLY ----------------
 async function getAIReply(chatId, message) {
-    initChatMemory(chatId);
+    const chatState = getChatState(chatId);
 
     // Include last N messages for context
-    const contextMessages = memory[chatId]
+    const contextMessages = chatState.history
         .slice(-CONTEXT_LIMIT)
         .map((entry) => ({ role: entry.role, content: entry.content }));
 
@@ -326,6 +394,7 @@ function buildHelpMessage() {
         `${COMMAND_PREFIX}help - Show this help message`,
         `${COMMAND_PREFIX}reset - Clear our conversation history for this chat`,
         `${COMMAND_PREFIX}history - Summarise the latest conversation context`,
+        `${COMMAND_PREFIX}quickreplies - Review the quick replies I\'ve used here`,
         `${COMMAND_PREFIX}policy - Read how I keep conversations safe`,
         `${COMMAND_PREFIX}privacy - Understand what I store`,
         `${COMMAND_PREFIX}stats - See usage insights for this chat`,
@@ -334,8 +403,8 @@ function buildHelpMessage() {
 }
 
 function formatHistorySummary(chatId) {
-    initChatMemory(chatId);
-    const lastEntries = memory[chatId].slice(-6);
+    const chatState = getChatState(chatId);
+    const lastEntries = chatState.history.slice(-6);
 
     if (lastEntries.length === 0) {
         return 'There\'s no saved conversation history yet.';
@@ -368,6 +437,7 @@ function buildPrivacyMessage() {
 
 function buildStatsMessage(chatId) {
     const responses = allResponses[chatId] || [];
+    const chatState = getChatState(chatId);
     const total = responses.length;
     const openAIResponses = responses.filter((entry) => entry.source === 'openai').length;
     const memoryResponses = responses.filter((entry) => entry.source === 'memory').length;
@@ -379,7 +449,8 @@ function buildStatsMessage(chatId) {
         `• Total replies sent: ${total}`,
         `• AI generated replies: ${openAIResponses}`,
         `• Memory lookups: ${memoryResponses}`,
-        `• Quick replies: ${predefinedResponses}`
+        `• Quick replies: ${predefinedResponses}`,
+        `• Quick replies remembered: ${chatState.quickReplies.length}`
     ];
 
     if (lastInteraction) {
@@ -393,12 +464,31 @@ function buildStatsMessage(chatId) {
     return lines.join('\n');
 }
 
+function buildQuickRepliesMessage(chatId) {
+    const chatState = getChatState(chatId);
+    const quickReplies = chatState.quickReplies;
+
+    if (quickReplies.length === 0) {
+        return 'I haven\'t used any quick replies in this chat yet. Say hello and I will remember it!';
+    }
+
+    const lines = quickReplies.map((entry) => {
+        const timestamp = new Date(entry.timestamp).toLocaleString();
+        return `• "${entry.userMessage}" → ${entry.reply} (${timestamp})`;
+    });
+
+    return [`Here are the quick replies I\'ve used in this chat:`, ...lines].join('\n');
+}
+
 function handleCommand(command, chatId) {
     switch (command) {
     case 'help':
         return buildHelpMessage();
     case 'reset':
-        memory[chatId] = [];
+        memory[chatId] = {
+            history: [],
+            quickReplies: []
+        };
         saveMemory();
         if (allResponses[chatId]) {
             delete allResponses[chatId];
@@ -407,6 +497,8 @@ function handleCommand(command, chatId) {
         return 'Our conversation history has been cleared. Feel free to start fresh!';
     case 'history':
         return formatHistorySummary(chatId);
+    case 'quickreplies':
+        return buildQuickRepliesMessage(chatId);
     case 'policy':
     case 'safety':
         return buildPolicyMessage();
@@ -525,15 +617,7 @@ client.on('message', async (message) => {
     chatCooldowns.set(chatId, Date.now());
 
     if (outputSource === 'predefined') {
-        const lastTwo = memory[chatId]?.slice(-2) || [];
-        const alreadyStored = lastTwo.some(
-            (entry) => entry?.role === 'assistant' && entry.content === reply
-        );
-
-        if (!alreadyStored) {
-            recordInteraction(chatId, cleanMessage, reply, outputSource);
-        }
-        return;
+        storeQuickReply(chatId, cleanMessage, reply);
     }
 
     recordInteraction(chatId, cleanMessage, reply, outputSource || 'system');
