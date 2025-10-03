@@ -1,8 +1,8 @@
-require('dotenv').config();
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const OpenAI = require('openai');
 const fs = require('fs');
+const { getServiceUrl } = require('./microservices/registry');
+const fetch = (...args) => globalThis.fetch(...args);
 
 const {
     BOT_NAME,
@@ -24,12 +24,6 @@ const {
     GENERAL_RESPONSES_FILE,
     PUPPETEER_OPTIONS
 } = require('./config');
-
-if (!process.env.OPENAI_API_KEY) {
-    throw new Error('Missing OPENAI_API_KEY environment variable. Please configure your .env file.');
-}
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const chatCooldowns = new Map();
 let selfId = null;
@@ -56,20 +50,24 @@ async function moderateContent(text, type = 'input') {
     if (!text) return { flagged: false, categories: [], type };
 
     try {
-        const result = await openai.moderations.create({
-            model: 'omni-moderation-latest',
-            input: text
+        const response = await fetch(`${getServiceUrl('moderation')}/moderate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ input: text, type })
         });
 
-        const flagged = result?.results?.[0]?.flagged ?? false;
-        const categories = Object.entries(result?.results?.[0]?.categories || {})
-            .filter(([, value]) => Boolean(value))
-            .map(([key]) => key.replace(/_/g, ' '));
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data?.error || `Moderation service returned status ${response.status}`);
+        }
+
+        const categories = Array.isArray(data?.categories) ? data.categories : [];
 
         return {
-            flagged,
+            flagged: Boolean(data?.flagged),
             categories,
-            type
+            type: data?.type || type
         };
     } catch (error) {
         console.warn('⚠️ Moderation request failed:', error);
@@ -87,6 +85,37 @@ function checkSensitivePatterns(text) {
     }
 
     return null;
+}
+
+async function requestChatCompletion({ messages, temperature = 0.7, model = 'gpt-4o-mini' }) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+        throw new Error('Chat completion requires at least one message.');
+    }
+
+    try {
+        const response = await fetch(`${getServiceUrl('chat')}/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages, temperature, model })
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data?.error || `Chat service returned status ${response.status}`);
+        }
+
+        const reply = typeof data?.reply === 'string' ? data.reply.trim() : '';
+
+        if (!reply) {
+            throw new Error('Chat service returned an empty reply.');
+        }
+
+        return reply;
+    } catch (error) {
+        console.error('Chat service error:', error);
+        throw error;
+    }
 }
 
 function isRateLimited(chatId) {
@@ -109,6 +138,8 @@ function normaliseResponsePayload(entry) {
     let mediaUrl = '';
     let stickerUrl = '';
     let sendAsSticker = false;
+    let mediaBase64 = '';
+    let mediaMimeType = '';
 
     if (typeof rawResponse === 'string') {
         text = rawResponse.trim();
@@ -132,6 +163,14 @@ function normaliseResponsePayload(entry) {
         if (typeof rawResponse.sendAsSticker === 'boolean') {
             sendAsSticker = rawResponse.sendAsSticker;
         }
+
+        if (typeof rawResponse.mediaBase64 === 'string') {
+            mediaBase64 = rawResponse.mediaBase64.trim();
+        }
+
+        if (typeof rawResponse.mediaMimeType === 'string') {
+            mediaMimeType = rawResponse.mediaMimeType.trim();
+        }
     }
 
     if (!mediaUrl && typeof entry.mediaUrl === 'string') {
@@ -144,6 +183,14 @@ function normaliseResponsePayload(entry) {
 
     if (!caption && typeof entry.caption === 'string') {
         caption = entry.caption.trim();
+    }
+
+    if (!mediaBase64 && typeof entry.mediaBase64 === 'string') {
+        mediaBase64 = entry.mediaBase64.trim();
+    }
+
+    if (!mediaMimeType && typeof entry.mediaMimeType === 'string') {
+        mediaMimeType = entry.mediaMimeType.trim();
     }
 
     if (typeof entry.sendAsSticker === 'boolean') {
@@ -168,7 +215,9 @@ function normaliseResponsePayload(entry) {
         caption: hasCaption ? caption : '',
         mediaUrl: hasMedia ? mediaUrl : '',
         stickerUrl: hasSticker ? stickerUrl : '',
-        sendAsSticker: Boolean(sendAsSticker)
+        sendAsSticker: Boolean(sendAsSticker),
+        mediaBase64: mediaBase64 || '',
+        mediaMimeType: mediaMimeType || ''
     };
 }
 
@@ -415,7 +464,7 @@ function describeResponseForLog(response) {
             return '[sticker]';
         }
 
-        if (response.mediaUrl) {
+        if (response.mediaUrl || response.mediaBase64) {
             return '[media]';
         }
     }
@@ -436,8 +485,20 @@ async function sendWithTyping(message, response) {
         return;
     }
 
-    const { text, caption, mediaUrl, stickerUrl, sendAsSticker } = response;
+    const { text, caption, mediaUrl, stickerUrl, sendAsSticker, mediaBase64, mediaMimeType } = response;
     const captionToUse = text || caption || undefined;
+
+    if (mediaBase64) {
+        try {
+            const mimeType = mediaMimeType || 'image/png';
+            const extension = mimeType.split('/')[1] || 'png';
+            const media = new MessageMedia(mimeType, mediaBase64, `image.${extension}`);
+            await message.reply(media, undefined, captionToUse ? { caption: captionToUse } : undefined);
+            return;
+        } catch (error) {
+            console.warn('⚠️ Failed to send inline media payload. Falling back to alternative content.', error);
+        }
+    }
 
     if ((stickerUrl || sendAsSticker) && (stickerUrl || mediaUrl)) {
         const stickerSource = stickerUrl || mediaUrl;
@@ -594,17 +655,10 @@ async function getAIReply(chatId, message) {
     contextMessages.push({ role: 'user', content: message });
 
     try {
-        const response = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const reply = await requestChatCompletion({
             messages: contextMessages,
             temperature: 0.7
         });
-
-        const reply = response.choices?.[0]?.message?.content?.trim();
-
-        if (!reply) {
-            throw new Error('Empty response from OpenAI');
-        }
 
         return reply;
     } catch (error) {
@@ -625,8 +679,10 @@ function buildHelpMessage() {
         `${COMMAND_PREFIX}privacy - Understand what I store`,
         `${COMMAND_PREFIX}stats - See usage insights for this chat`,
         `${COMMAND_PREFIX}songs <mood or artist> - Discover tailored music suggestions`,
+        `${COMMAND_PREFIX}songlink <song name> - Grab a quick YouTube link for a track`,
         `${COMMAND_PREFIX}plan <goal or situation> - Get a quick day-to-day action plan`,
         `${COMMAND_PREFIX}meal <ingredients or dietary need> - Receive speedy meal ideas`,
+        `${COMMAND_PREFIX}image <prompt> - Generate an AI image (limited daily uses)`,
         `${COMMAND_PREFIX}about - Learn more about ${BOT_NAME}`
     ].join('\n');
 }
@@ -657,19 +713,13 @@ async function generateTaskResponse({
     const userPrompt = trimmedQuery || defaultPrompt;
 
     try {
-        const response = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const reply = await requestChatCompletion({
             messages: [
                 { role: 'system', content: systemContent },
                 { role: 'user', content: userPrompt }
             ],
             temperature
         });
-
-        let reply = response.choices?.[0]?.message?.content?.trim();
-        if (!reply) {
-            throw new Error('Empty response from OpenAI');
-        }
 
         const outputModeration = await moderateContent(reply, 'output');
         if (outputModeration.flagged) {
@@ -731,6 +781,115 @@ async function buildMealIdeas(query) {
             '• Remind the user to adjust for allergies or dietary restrictions if relevant.'
         ])
     });
+}
+
+async function fetchSongLink(query) {
+    const trimmed = typeof query === 'string' ? query.trim() : '';
+
+    if (!trimmed) {
+        return 'Please tell me which song you would like me to find.';
+    }
+
+    try {
+        const response = await fetch(`${getServiceUrl('youtube')}/search`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: trimmed })
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data?.error || `YouTube service returned status ${response.status}`);
+        }
+
+        if (!data?.url) {
+            return `I couldn't find a matching YouTube link for "${trimmed}".`;
+        }
+
+        const lines = [
+            "Here’s the best match I found:",
+            data.title ? `${data.title}${data.author ? ` – ${data.author}` : ''}` : null,
+            data.url
+        ].filter(Boolean);
+
+        if (typeof data?.description === 'string' && data.description.trim()) {
+            lines.splice(1, 0, data.description.trim());
+        }
+
+        return lines.join('\n');
+    } catch (error) {
+        console.error('YouTube lookup failed:', error);
+        return 'I had trouble searching YouTube just now. Please try again in a moment.';
+    }
+}
+
+async function requestImageGeneration(chatId, prompt) {
+    try {
+        const response = await fetch(`${getServiceUrl('image')}/image`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chatId, prompt })
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            const usage = data?.usage;
+            if (response.status === 429 && usage) {
+                const remainingMs = typeof usage.resetInMs === 'number' ? usage.resetInMs : null;
+                const remainingMinutes = remainingMs ? Math.ceil(remainingMs / 60000) : null;
+                const waitMessage = remainingMinutes ? ` Try again in about ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'}.` : '';
+                return { error: `You have reached the daily image limit of ${usage.limit}. ${waitMessage}`.trim(), usage };
+            }
+
+            throw new Error(data?.error || `Image service returned status ${response.status}`);
+        }
+
+        return data;
+    } catch (error) {
+        console.error('Image service error:', error);
+        return { error: 'I couldn\'t create that image right now. Please try again later.' };
+    }
+}
+
+async function handleImageCommand(chatId, args) {
+    const trimmed = typeof args === 'string' ? args.trim() : '';
+
+    if (!trimmed) {
+        return 'Please describe the image you would like me to create (for example, "a cozy cabin in the snow").';
+    }
+
+    const moderation = await moderateContent(trimmed, 'image-prompt');
+    if (moderation.flagged) {
+        console.warn(`⚠️ Moderation blocked an image prompt for chat ${chatId}. Categories: ${moderation.categories.join(', ') || 'n/a'}`);
+        return SAFE_FAILURE_MESSAGE;
+    }
+
+    const result = await requestImageGeneration(chatId, trimmed);
+
+    if (result?.error) {
+        return result.error;
+    }
+
+    const image = Array.isArray(result?.images) ? result.images[0] : null;
+    if (!image || !image.base64) {
+        return 'The image service did not return a usable image. Please try again.';
+    }
+
+    const usage = result?.usage;
+    let captionSuffix = '';
+    if (usage && typeof usage.remaining === 'number') {
+        const remaining = usage.remaining;
+        const plural = remaining === 1 ? '' : 's';
+        captionSuffix = ` (${remaining} generation${plural} left today.)`;
+    }
+
+    return {
+        text: `Here is what I imagined for "${trimmed}".${captionSuffix}`,
+        mediaBase64: image.base64,
+        mediaMimeType: image.mimeType || 'image/png'
+    };
 }
 
 function formatHistorySummary(chatId) {
@@ -907,6 +1066,10 @@ async function handleCommand(command, chatId, args = '') {
     case 'song':
     case 'songs':
         return await buildSongSuggestions(args);
+    case 'songlink':
+    case 'youtube':
+    case 'yt':
+        return await fetchSongLink(args);
     case 'plan':
     case 'planner':
     case 'daily':
@@ -916,6 +1079,11 @@ async function handleCommand(command, chatId, args = '') {
     case 'recipe':
     case 'recipes':
         return await buildMealIdeas(args);
+    case 'image':
+    case 'images':
+    case 'img':
+    case 'art':
+        return await handleImageCommand(chatId, args);
     case 'about':
         return `${BOT_NAME} is an AI assistant powered by OpenAI. I can help answer questions and keep the conversation flowing!`;
     default:
@@ -1095,4 +1263,9 @@ client.on('message', async (message) => {
     );
 });
 
-client.initialize();
+async function startBot() {
+    await client.initialize();
+    return client;
+}
+
+module.exports = startBot;
