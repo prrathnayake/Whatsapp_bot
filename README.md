@@ -8,10 +8,13 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 - 💬 Rolling context memory per chat backed by a lightweight on-disk log
 - 🧠 Memory-first answers for facts you previously shared before asking OpenAI
 - ⚙️ Built-in bot commands (`!help`, `!reset`, `!history`, `!policy`, `!privacy`, `!stats`, `!songs`, `!plan`, `!meal`, `!about`)
+- 🧩 Node.js microservices for chat, moderation, YouTube lookups, and image generation with a single orchestrated entry point
 - 🙋‍♂️ Friendly predefined replies for common greetings and sentiments
 - 🗃️ Local logging of all bot responses for later review
 - 🔐 Automatic environment validation for the `OPENAI_API_KEY`
 - 🛡️ Safety features including OpenAI moderation, sensitive data detection, and per-chat rate limiting
+- 🎵 Instant YouTube song link discovery via `!songlink`
+- 🖼️ Daily limited AI image generation via `!image`
 
 ## Getting Started
 
@@ -23,9 +26,9 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
    ```ini
    OPENAI_API_KEY=sk-your-key
    ```
-3. Run the bot:
+3. Run the bot (this starts the microservices and the WhatsApp client):
    ```bash
-   node bot.js
+   npm start
    ```
 4. Scan the displayed QR code in WhatsApp to authorise the session.
 
@@ -47,6 +50,8 @@ If you need to stay on PHP-only hosting, use the rewritten bot in [`php-bot/`](.
 | `!songs <mood or artist>` | Suggest a short list of matching songs |
 | `!plan <goal or situation>` | Draft a quick plan for everyday tasks |
 | `!meal <ingredients or dietary need>` | Offer speedy meal or recipe ideas |
+| `!songlink <song name>` | Find the top YouTube result for a requested track |
+| `!image <prompt>` | Generate an AI image (limited to a few per chat each day) |
 | `!about`   | Learn about the bot |
 
 ## Data Files
