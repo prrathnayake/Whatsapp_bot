@@ -7,7 +7,7 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 - 🤖 Conversational AI responses backed by `gpt-4o-mini` with configurable system prompt
 - 💬 Rolling context memory per chat backed by a lightweight on-disk log
 - 🧠 Memory-first answers for facts you previously shared before asking OpenAI
-- ⚙️ Built-in bot commands (`!help`, `!reset`, `!history`, `!policy`, `!privacy`, `!stats`, `!about`)
+- ⚙️ Built-in bot commands (`!help`, `!reset`, `!history`, `!policy`, `!privacy`, `!stats`, `!songs`, `!plan`, `!meal`, `!about`)
 - 🙋‍♂️ Friendly predefined replies for common greetings and sentiments
 - 🗃️ Local logging of all bot responses for later review
 - 🔐 Automatic environment validation for the `OPENAI_API_KEY`
@@ -40,6 +40,9 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 | `!policy`  | Display the assistant's safety guidelines |
 | `!privacy` | Explain what data is stored and how to clear it |
 | `!stats`   | Share usage insights for the current chat |
+| `!songs <mood or artist>` | Suggest a short list of matching songs |
+| `!plan <goal or situation>` | Draft a quick plan for everyday tasks |
+| `!meal <ingredients or dietary need>` | Offer speedy meal or recipe ideas |
 | `!about`   | Learn about the bot |
 
 ## Data Files
