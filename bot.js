@@ -5,14 +5,26 @@ const OpenAI = require('openai');
 const fs = require('fs');
 const path = require('path');
 
+if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Missing OPENAI_API_KEY environment variable. Please configure your .env file.');
+}
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------------- CONFIG ----------------
-const BOT_NAME = "Emponyoo";
+const BOT_NAME = 'Emponyoo';
 const TYPING_DELAY_MS = 1500;
 const MEMORY_FILE = path.join(__dirname, 'memory.json');
 const RESPONSES_FILE = path.join(__dirname, 'all_responses.json');
-const CONTEXT_LIMIT = 5; // last 5 messages per chat
+const CONTEXT_LIMIT = 12; // number of messages (user + assistant) kept in the rolling context
+const MAX_SAVED_HISTORY = 50; // hard cap of messages saved per chat
+const MAX_SAVED_RESPONSES = 100;
+const COMMAND_PREFIX = '!';
+
+const SYSTEM_PROMPT = `You are ${BOT_NAME}, a warm and professional WhatsApp assistant.
+- Always introduce yourself as ${BOT_NAME} when asked who you are.
+- Keep answers short and conversational (2-4 sentences unless the user explicitly asks for more).
+- If you are unsure about something, be honest and offer to help look it up.`;
 // ----------------------------------------
 
 const client = new Client({
@@ -21,27 +33,111 @@ const client = new Client({
 });
 
 // ---------------- MEMORY ----------------
-let memory = fs.existsSync(MEMORY_FILE) ? JSON.parse(fs.readFileSync(MEMORY_FILE)) : {};
-let allResponses = fs.existsSync(RESPONSES_FILE) ? JSON.parse(fs.readFileSync(RESPONSES_FILE)) : {};
+function readJsonFile(filePath, fallback) {
+    try {
+        if (!fs.existsSync(filePath)) return fallback;
+        const raw = fs.readFileSync(filePath, 'utf8');
+        return raw ? JSON.parse(raw) : fallback;
+    } catch (error) {
+        console.warn(`⚠️ Unable to read ${filePath}. Using fallback.`, error);
+        return fallback;
+    }
+}
+
+let memory = readJsonFile(MEMORY_FILE, {});
+let allResponses = readJsonFile(RESPONSES_FILE, {});
+
+memory = Object.fromEntries(
+    Object.entries(memory || {}).map(([chatId, history]) => [chatId, normaliseHistory(history)])
+);
+
+allResponses = Object.fromEntries(
+    Object.entries(allResponses || {}).map(([chatId, history]) => [
+        chatId,
+        Array.isArray(history) ? history.slice(-MAX_SAVED_RESPONSES) : []
+    ])
+);
+
+function normaliseHistory(history) {
+    if (!Array.isArray(history)) {
+        return [];
+    }
+
+    // Legacy support: previous versions stored plain strings alternating between user & bot.
+    return history
+        .map((entry, index) => {
+            if (typeof entry === 'string') {
+                return {
+                    role: index % 2 === 0 ? 'user' : 'assistant',
+                    content: entry
+                };
+            }
+
+            if (entry && typeof entry === 'object' && entry.content && entry.role) {
+                return { role: entry.role, content: entry.content };
+            }
+
+            return null;
+        })
+        .filter(Boolean)
+        .slice(-MAX_SAVED_HISTORY);
+}
 
 // Ensure memory for each chat
 function initChatMemory(chatId) {
-    if(!memory[chatId]) memory[chatId] = [];
+    if (!memory[chatId]) {
+        memory[chatId] = [];
+        return;
+    }
+
+    memory[chatId] = normaliseHistory(memory[chatId]);
 }
 
 // Save memory & responses
-function saveMemory() { fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2)); }
-function saveAllResponses() { fs.writeFileSync(RESPONSES_FILE, JSON.stringify(allResponses, null, 2)); }
+function saveMemory() {
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2));
+}
+
+function saveAllResponses() {
+    fs.writeFileSync(RESPONSES_FILE, JSON.stringify(allResponses, null, 2));
+}
+
+function appendToHistory(chatId, entry) {
+    initChatMemory(chatId);
+    memory[chatId].push(entry);
+
+    if (memory[chatId].length > MAX_SAVED_HISTORY) {
+        memory[chatId] = memory[chatId].slice(-MAX_SAVED_HISTORY);
+    }
+
+    saveMemory();
+}
+
+function appendResponse(chatId, record) {
+    if (!allResponses[chatId]) {
+        allResponses[chatId] = [];
+    }
+
+    allResponses[chatId].push(record);
+
+    if (allResponses[chatId].length > MAX_SAVED_RESPONSES) {
+        allResponses[chatId] = allResponses[chatId].slice(-MAX_SAVED_RESPONSES);
+    }
+
+    saveAllResponses();
+}
 
 // ---------------- PREDEFINED REPLIES ----------------
 function getPredefinedReply(text) {
-    text = text.toLowerCase();
-    if(text.includes('hello') || text.includes('hi')) return 'Hello! 👋';
-    if(text.includes('how are you')) return "I'm just a bot, but I'm doing great! 😄";
-    if(text.includes('good morning')) return 'Good morning! ☀️';
-    if(text.includes('good night')) return 'Good night! 🌙';
-    if(text.includes('thanks') || text.includes('thank you')) return "You're welcome! 😊";
-    if(text.includes('bye') || text.includes('goodbye')) return 'Goodbye! 👋';
+    const normalised = text.toLowerCase();
+
+    if (normalised.includes('hello') || normalised.includes('hi')) return 'Hello! 👋';
+    if (normalised.includes('how are you')) return "I\'m just a bot, but I\'m doing great! 😄";
+    if (normalised.includes('good morning')) return 'Good morning! ☀️';
+    if (normalised.includes('good night')) return 'Good night! 🌙';
+    if (normalised.includes('thanks') || normalised.includes('thank you')) return "You\'re welcome! 😊";
+    if (normalised.includes('bye') || normalised.includes('goodbye')) return 'Goodbye! 👋';
+
     return null;
 }
 
@@ -50,31 +146,87 @@ async function getAIReply(chatId, message) {
     initChatMemory(chatId);
 
     // Include last N messages for context
-    const contextMessages = memory[chatId].slice(-CONTEXT_LIMIT).map(m => ({ role: 'user', content: m }));
+    const contextMessages = memory[chatId]
+        .slice(-CONTEXT_LIMIT)
+        .map((entry) => ({ role: entry.role, content: entry.content }));
+
+    contextMessages.unshift({ role: 'system', content: SYSTEM_PROMPT });
     contextMessages.push({ role: 'user', content: message });
 
     try {
         const response = await openai.chat.completions.create({
-            model: 'gpt-4',
+            model: 'gpt-4o-mini',
             messages: contextMessages,
             temperature: 0.7
         });
 
-        const reply = response.choices[0].message.content;
+        const reply = response.choices?.[0]?.message?.content?.trim();
 
-        // Save in memory
-        memory[chatId].push(message);
-        memory[chatId].push(reply);
-        saveMemory();
+        if (!reply) {
+            throw new Error('Empty response from OpenAI');
+        }
 
-        if(!allResponses[chatId]) allResponses[chatId] = [];
-        allResponses[chatId].push({ message, reply, timestamp: new Date().toISOString() });
-        saveAllResponses();
+        appendToHistory(chatId, { role: 'user', content: message });
+        appendToHistory(chatId, { role: 'assistant', content: reply });
+
+        appendResponse(chatId, {
+            message,
+            reply,
+            timestamp: new Date().toISOString()
+        });
 
         return reply;
     } catch (error) {
         console.error('OpenAI error:', error);
         return "⚠️ Sorry, I couldn't process that.";
+    }
+}
+
+// ---------------- COMMANDS ----------------
+function buildHelpMessage() {
+    return [
+        `Here\'s what I can do:`,
+        `${COMMAND_PREFIX}help - Show this help message`,
+        `${COMMAND_PREFIX}reset - Clear our conversation history for this chat`,
+        `${COMMAND_PREFIX}history - Summarise the latest conversation context`,
+        `${COMMAND_PREFIX}about - Learn more about ${BOT_NAME}`
+    ].join('\n');
+}
+
+function formatHistorySummary(chatId) {
+    initChatMemory(chatId);
+    const lastEntries = memory[chatId].slice(-6);
+
+    if (lastEntries.length === 0) {
+        return 'There\'s no saved conversation history yet.';
+    }
+
+    const lines = lastEntries.map((entry) => {
+        const prefix = entry.role === 'assistant' ? `${BOT_NAME}:` : 'You:';
+        return `${prefix} ${entry.content}`;
+    });
+
+    return `Here\'s the latest context I\'m using:\n${lines.join('\n')}`;
+}
+
+function handleCommand(command, chatId) {
+    switch (command) {
+    case 'help':
+        return buildHelpMessage();
+    case 'reset':
+        memory[chatId] = [];
+        saveMemory();
+        if (allResponses[chatId]) {
+            delete allResponses[chatId];
+            saveAllResponses();
+        }
+        return 'Our conversation history has been cleared. Feel free to start fresh!';
+    case 'history':
+        return formatHistorySummary(chatId);
+    case 'about':
+        return `${BOT_NAME} is an AI assistant powered by OpenAI. I can help answer questions and keep the conversation flowing!`;
+    default:
+        return `I don\'t recognise that command. Try ${COMMAND_PREFIX}help for a list of available commands.`;
     }
 }
 
@@ -89,28 +241,38 @@ client.on('message', async (message) => {
     const isPrivate = chatId.endsWith('@s.whatsapp.net');
 
     let shouldRespond = false;
-    let cleanMessage = message.body;
+    let cleanMessage = message.body.trim();
 
-    if(isPrivate) {
+    if (isPrivate) {
         shouldRespond = true; // respond to all private messages
-    } else if(isGroup) {
+    } else if (isGroup) {
         // Trigger if message contains "Emponyoo,"
         const regex = new RegExp(`\\b${BOT_NAME}\\b[,\\s]*`, 'i');
-        if(regex.test(message.body)) {
+        if (regex.test(message.body)) {
             shouldRespond = true;
             cleanMessage = message.body.replace(regex, '').trim();
         }
     }
 
-    if(!shouldRespond) return;
+    if (!shouldRespond || !cleanMessage) return;
+
+    if (cleanMessage.startsWith(COMMAND_PREFIX)) {
+        const command = cleanMessage.slice(COMMAND_PREFIX.length).trim().toLowerCase();
+        const commandName = command.split(/\s+/)[0];
+        const reply = handleCommand(commandName, chatId);
+
+        await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
+        await message.reply(reply);
+        return;
+    }
 
     // Check predefined replies
     let reply = getPredefinedReply(cleanMessage);
-    if(!reply) reply = await getAIReply(chatId, cleanMessage);
+    if (!reply) reply = await getAIReply(chatId, cleanMessage);
 
-    if(reply) {
+    if (reply) {
         // Typing simulation
-        await new Promise(r => setTimeout(r, TYPING_DELAY_MS));
+        await new Promise((r) => setTimeout(r, TYPING_DELAY_MS));
         await message.reply(reply);
     }
 });
