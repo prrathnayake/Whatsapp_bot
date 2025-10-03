@@ -31,6 +31,7 @@ if (!process.env.OPENAI_API_KEY) {
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const chatCooldowns = new Map();
+let selfId = null;
 // ----------------------------------------
 
 const client = new Client({
@@ -554,7 +555,17 @@ function handleCommand(command, chatId) {
 
 // ---------------- EVENTS ----------------
 client.on('qr', qr => qrcode.generate(qr, { small: true }));
-client.on('ready', () => console.log(`✅ ${BOT_NAME} is connected and ready!`));
+client.on('ready', () => {
+    selfId = client?.info?.wid?._serialized || null;
+    console.log(`✅ ${BOT_NAME} is connected and ready!`);
+});
+
+function normaliseWid(wid) {
+    if (typeof wid !== 'string') return null;
+    const trimmed = wid.trim();
+    if (!trimmed) return null;
+    return trimmed.replace(/@.*$/, '');
+}
 
 // ---------------- MESSAGE HANDLER ----------------
 client.on('message', async (message) => {
@@ -563,16 +574,53 @@ client.on('message', async (message) => {
     const isPrivate = chatId.endsWith('@s.whatsapp.net');
 
     let shouldRespond = false;
-    let cleanMessage = message.body.trim();
+    const rawBody = typeof message.body === 'string' ? message.body : '';
+    let cleanMessage = rawBody.trim();
 
     if (isPrivate) {
         shouldRespond = true; // respond to all private messages
     } else if (isGroup) {
-        // Trigger if message contains "Emponyoo,"
+        // Trigger if message contains the bot name
         const regex = new RegExp(`\\b${BOT_NAME}\\b[,\\s]*`, 'i');
-        if (regex.test(message.body)) {
+        if (regex.test(rawBody)) {
             shouldRespond = true;
-            cleanMessage = message.body.replace(regex, '').trim();
+            const withoutName = rawBody.replace(regex, '').trim();
+            if (withoutName) {
+                cleanMessage = withoutName;
+            }
+        }
+
+        if (!shouldRespond && selfId) {
+            const targetId = normaliseWid(selfId);
+            const mentionedIds = new Set();
+
+            if (Array.isArray(message.mentionedIds)) {
+                for (const id of message.mentionedIds) {
+                    if (id) mentionedIds.add(id);
+                }
+            } else if (typeof message.getMentions === 'function') {
+                try {
+                    const mentions = await message.getMentions();
+                    for (const contact of mentions || []) {
+                        const id = contact?.id?._serialized || contact?.id;
+                        if (id) mentionedIds.add(id);
+                    }
+                } catch (error) {
+                    console.warn('⚠️ Unable to read message mentions', error);
+                }
+            }
+
+            for (const id of mentionedIds) {
+                const normalised = normaliseWid(typeof id === 'string' ? id : id?._serialized || '');
+                if (normalised && normalised === targetId) {
+                    shouldRespond = true;
+                    const withoutMentions = rawBody.replace(/@\S+/g, ' ').replace(/\s+/g, ' ').trim();
+                    if (withoutMentions) {
+                        cleanMessage = withoutMentions;
+                    }
+                    break;
+                }
+            }
         }
     }
 
