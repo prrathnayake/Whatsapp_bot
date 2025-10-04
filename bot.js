@@ -486,6 +486,7 @@ async function sendWithTyping(message, response) {
     }
 
     const { text, caption, mediaUrl, stickerUrl, sendAsSticker, mediaBase64, mediaMimeType } = response;
+    const mentions = Array.isArray(response.mentions) ? response.mentions.filter(Boolean) : [];
     const captionToUse = text || caption || undefined;
 
     if (mediaBase64) {
@@ -525,8 +526,37 @@ async function sendWithTyping(message, response) {
         }
     }
 
-    const fallbackText = captionToUse || SAFE_FAILURE_MESSAGE;
-    await message.reply(fallbackText);
+    const options = mentions.length > 0 ? { mentions } : undefined;
+    if (captionToUse || mentions.length > 0) {
+        const textToSend = captionToUse || mentions
+            .map((contact) => {
+                const id = contact?.id;
+                if (!id) return null;
+                if (typeof id === 'string') {
+                    const normalised = normaliseWid(id);
+                    return normalised ? `@${normalised}` : null;
+                }
+
+                if (typeof id.user === 'string') {
+                    return `@${id.user}`;
+                }
+
+                const serialized = id?._serialized;
+                if (serialized) {
+                    const normalised = normaliseWid(serialized);
+                    return normalised ? `@${normalised}` : null;
+                }
+
+                return null;
+            })
+            .filter(Boolean)
+            .join(' ');
+
+        await message.reply(textToSend || SAFE_FAILURE_MESSAGE, undefined, options);
+        return;
+    }
+
+    await message.reply(SAFE_FAILURE_MESSAGE);
 }
 
 function extractKeywords(text) {
@@ -1002,9 +1032,103 @@ function buildLengthWarning() {
     return `That message is quite long. Please keep it under ${MAX_MESSAGE_LENGTH} characters so I can help effectively.`;
 }
 
+function isMentionAllTrigger(message) {
+    if (!message) return false;
+
+    const trimmed = message.trim().toLowerCase();
+    if (!trimmed) return false;
+
+    if (trimmed === 'everyone' || trimmed === '@everyone') {
+        return true;
+    }
+
+    const prefixes = ['@everyone', 'everyone'];
+    for (const prefix of prefixes) {
+        if (trimmed.startsWith(prefix)) {
+            const remainder = trimmed.slice(prefix.length);
+            if (!remainder) return true;
+            if (/^[\s,.!?:;\-]+/.test(remainder)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+async function tryHandleMentionAll(message, cleanMessage, chatId) {
+    if (!isMentionAllTrigger(cleanMessage)) return false;
+
+    let chat;
+    try {
+        chat = await message.getChat();
+    } catch (error) {
+        console.warn('⚠️ Unable to load chat details for mention-all request.', error);
+        return false;
+    }
+
+    if (!chat?.isGroup) return false;
+
+    const participants = Array.isArray(chat.participants) ? chat.participants : [];
+    const mentionSet = new Set();
+    const selfNormalised = selfId ? normaliseWid(selfId) : null;
+
+    const mentionData = await Promise.all(participants.map(async (participant) => {
+        const participantId = participant?.id;
+        const serialized = typeof participantId === 'string' ? participantId : participantId?._serialized;
+        if (!serialized) return null;
+
+        const normalisedId = normaliseWid(serialized);
+        if (!normalisedId) return null;
+
+        if (selfNormalised && normalisedId === selfNormalised) {
+            return null;
+        }
+
+        if (mentionSet.has(normalisedId)) {
+            return null;
+        }
+
+        try {
+            const contact = await client.getContactById(serialized);
+            if (!contact) return null;
+
+            mentionSet.add(normalisedId);
+            const placeholder = `@${contact?.id?.user || normalisedId}`;
+
+            return { contact, placeholder };
+        } catch (error) {
+            console.warn(`⚠️ Unable to fetch contact ${serialized} for mention-all request.`, error);
+            return null;
+        }
+    }));
+
+    const validMentions = mentionData.filter(Boolean);
+
+    if (validMentions.length === 0) {
+        const reply = 'I couldn\'t find anyone to mention in this group.';
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'mention-all');
+        return true;
+    }
+
+    const mentionText = validMentions.map((entry) => entry.placeholder).join(' ');
+    const mentionContacts = validMentions.map((entry) => entry.contact);
+
+    await sendWithTyping(message, { text: mentionText, mentions: mentionContacts });
+    chatCooldowns.set(chatId, Date.now());
+    recordInteraction(chatId, cleanMessage, mentionText, 'mention-all');
+    return true;
+}
+
 async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
     if (!cleanMessage || !chatId.endsWith('@g.us')) return false;
     if (cleanMessage.startsWith(COMMAND_PREFIX)) return false;
+
+    if (await tryHandleMentionAll(message, cleanMessage, chatId)) {
+        return true;
+    }
 
     const generalResponse = getGeneralReply(cleanMessage);
     if (!generalResponse) return false;
