@@ -28,11 +28,18 @@ const {
     MODERATION_CACHE_TTL_MS,
     MODERATION_CACHE_MAX_ENTRIES,
     CHAT_REQUEST_TIMEOUT_MS,
+    CHAT_REQUEST_MAX_RETRIES,
+    CHAT_REQUEST_BASE_BACKOFF_MS,
+    CHAT_REQUEST_BACKOFF_JITTER,
+    CHAT_COMPLETION_CACHE_TTL_MS,
+    CHAT_COMPLETION_CACHE_MAX_ENTRIES,
     PUPPETEER_OPTIONS
 } = require('./config');
 
 const chatCooldowns = new Map();
 const moderationCache = new Map();
+const chatCompletionCache = new Map();
+const fileReadCache = new Map();
 let selfId = null;
 let saveAllResponsesTimer = null;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -52,19 +59,50 @@ const client = new Client({
 
 // ---------------- MEMORY ----------------
 function readJsonFile(filePath, fallback) {
-    try {
-        if (!fs.existsSync(filePath)) return fallback;
-        const raw = fs.readFileSync(filePath, 'utf8');
-        return raw ? JSON.parse(raw) : fallback;
-    } catch (error) {
-        console.warn(`⚠️ Unable to read ${filePath}. Using fallback.`, error);
-        return fallback;
+    const cached = fileReadCache.get(filePath);
+    if (cached) {
+        if (typeof cached.then === 'function') {
+            return cached;
+        }
+        return Promise.resolve(cached);
     }
+
+    const loadPromise = (async () => {
+        try {
+            const raw = await fs.promises.readFile(filePath, 'utf8');
+            if (!raw) return fallback;
+            const trimmed = raw.trim();
+            if (!trimmed) return fallback;
+
+            try {
+                return JSON.parse(trimmed);
+            } catch (parseError) {
+                console.warn(`⚠️ Unable to parse ${filePath}. Using fallback.`, parseError);
+                return fallback;
+            }
+        } catch (error) {
+            if (error?.code !== 'ENOENT') {
+                console.warn(`⚠️ Unable to read ${filePath}. Using fallback.`, error);
+            }
+            return fallback;
+        }
+    })();
+
+    fileReadCache.set(filePath, loadPromise);
+
+    return loadPromise.then((value) => {
+        fileReadCache.set(filePath, value);
+        return value;
+    });
 }
 
 const shouldUseModerationCache =
     Number.isFinite(MODERATION_CACHE_TTL_MS) && MODERATION_CACHE_TTL_MS > 0 &&
     Number.isFinite(MODERATION_CACHE_MAX_ENTRIES) && MODERATION_CACHE_MAX_ENTRIES > 0;
+
+const shouldUseCompletionCache =
+    Number.isFinite(CHAT_COMPLETION_CACHE_TTL_MS) && CHAT_COMPLETION_CACHE_TTL_MS > 0 &&
+    Number.isFinite(CHAT_COMPLETION_CACHE_MAX_ENTRIES) && CHAT_COMPLETION_CACHE_MAX_ENTRIES > 0;
 
 function getModerationCacheKey(text, type) {
     return `${type}:${text}`;
@@ -109,6 +147,100 @@ function storeModerationResult(cacheKey, result) {
 
     if (moderationCache.size > MODERATION_CACHE_MAX_ENTRIES && oldestKey) {
         moderationCache.delete(oldestKey);
+    }
+}
+
+function serialiseMessageForCache(message) {
+    if (!message || typeof message !== 'object') {
+        return { role: '', content: '' };
+    }
+
+    const role = typeof message.role === 'string' ? message.role : '';
+    const content = message.content;
+
+    if (typeof content === 'string') {
+        return { role, content };
+    }
+
+    if (Array.isArray(content) || (content && typeof content === 'object')) {
+        try {
+            return { role, content: JSON.stringify(content) };
+        } catch (error) {
+            return { role, content: '' };
+        }
+    }
+
+    if (typeof content === 'number' || typeof content === 'boolean') {
+        return { role, content: String(content) };
+    }
+
+    return { role, content: '' };
+}
+
+function getChatCompletionCacheKey(messages, temperature, model) {
+    try {
+        const serialisedMessages = (Array.isArray(messages) ? messages : [])
+            .map(serialiseMessageForCache);
+
+        const payload = {
+            model: typeof model === 'string' ? model : 'default',
+            temperature: Number.isFinite(temperature) ? Number(temperature) : temperature,
+            messages: serialisedMessages
+        };
+
+        return JSON.stringify(payload);
+    } catch (error) {
+        console.warn('⚠️ Unable to build chat completion cache key. Skipping cache.', error);
+        return null;
+    }
+}
+
+function getCachedChatCompletion(cacheKey) {
+    if (!cacheKey) return null;
+
+    const entry = chatCompletionCache.get(cacheKey);
+    if (!entry) return null;
+
+    if (entry.expiresAt < Date.now()) {
+        chatCompletionCache.delete(cacheKey);
+        return null;
+    }
+
+    return entry.reply;
+}
+
+function storeChatCompletion(cacheKey, reply) {
+    if (!cacheKey) return;
+
+    const now = Date.now();
+    chatCompletionCache.set(cacheKey, {
+        reply,
+        expiresAt: now + CHAT_COMPLETION_CACHE_TTL_MS,
+        createdAt: now
+    });
+
+    if (chatCompletionCache.size <= CHAT_COMPLETION_CACHE_MAX_ENTRIES) return;
+
+    for (const [key, entry] of chatCompletionCache.entries()) {
+        if (entry.expiresAt < now) {
+            chatCompletionCache.delete(key);
+        }
+    }
+
+    if (chatCompletionCache.size <= CHAT_COMPLETION_CACHE_MAX_ENTRIES) return;
+
+    let oldestKey = null;
+    let oldestTimestamp = Infinity;
+
+    for (const [key, entry] of chatCompletionCache.entries()) {
+        if (entry.createdAt < oldestTimestamp) {
+            oldestTimestamp = entry.createdAt;
+            oldestKey = key;
+        }
+    }
+
+    if (oldestKey) {
+        chatCompletionCache.delete(oldestKey);
     }
 }
 
@@ -171,6 +303,46 @@ function checkSensitivePatterns(text) {
     return null;
 }
 
+function parseRetryAfterHeader(headerValue) {
+    if (!headerValue) return null;
+
+    const numeric = Number(headerValue);
+    if (Number.isFinite(numeric)) {
+        return Math.max(0, numeric * 1000);
+    }
+
+    const parsedDate = Date.parse(headerValue);
+    if (!Number.isNaN(parsedDate)) {
+        const diff = parsedDate - Date.now();
+        return diff > 0 ? diff : 0;
+    }
+
+    return null;
+}
+
+function calculateBackoffDelay(attempt, retryAfterMs = null) {
+    const baseConfigured = Number.isFinite(CHAT_REQUEST_BASE_BACKOFF_MS)
+        ? Math.max(0, CHAT_REQUEST_BASE_BACKOFF_MS)
+        : 500;
+
+    const computedBase = retryAfterMs ?? baseConfigured * Math.pow(2, attempt);
+    const safeBase = Number.isFinite(computedBase) ? Math.max(0, computedBase) : baseConfigured;
+
+    const jitterRatio = Number.isFinite(CHAT_REQUEST_BACKOFF_JITTER)
+        ? Math.max(0, CHAT_REQUEST_BACKOFF_JITTER)
+        : 0;
+
+    if (jitterRatio === 0 || safeBase === 0) {
+        return safeBase;
+    }
+
+    const jitterAmplitude = safeBase * jitterRatio;
+    const min = Math.max(0, safeBase - jitterAmplitude / 2);
+    const max = safeBase + jitterAmplitude / 2;
+
+    return Math.random() * (max - min) + min;
+}
+
 async function requestChatCompletion({ messages, temperature = 0.7, model = 'gpt-4o-mini' }) {
     if (!Array.isArray(messages) || messages.length === 0) {
         throw new Error('Chat completion requires at least one message.');
@@ -179,41 +351,101 @@ async function requestChatCompletion({ messages, temperature = 0.7, model = 'gpt
     const timeoutMs = Number.isFinite(CHAT_REQUEST_TIMEOUT_MS) && CHAT_REQUEST_TIMEOUT_MS > 0
         ? CHAT_REQUEST_TIMEOUT_MS
         : 20000;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    try {
-        const response = await fetch(`${getServiceUrl('chat')}/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages, temperature, model }),
-            signal: controller.signal
-        });
+    const cacheKey = shouldUseCompletionCache
+        ? getChatCompletionCacheKey(messages, temperature, model)
+        : null;
 
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-            throw new Error(data?.error || `Chat service returned status ${response.status}`);
+    if (cacheKey) {
+        const cached = getCachedChatCompletion(cacheKey);
+        if (cached) {
+            return cached;
         }
-
-        const reply = typeof data?.reply === 'string' ? data.reply.trim() : '';
-
-        if (!reply) {
-            throw new Error('Chat service returned an empty reply.');
-        }
-
-        return reply;
-    } catch (error) {
-        if (error.name === 'AbortError') {
-            const timeoutError = new Error(`Chat service timed out after ${timeoutMs}ms`);
-            timeoutError.code = 'CHAT_TIMEOUT';
-            throw timeoutError;
-        }
-        console.error('Chat service error:', error);
-        throw error;
-    } finally {
-        clearTimeout(timeout);
     }
+
+    const maxAttempts = Math.max(
+        1,
+        Number.isFinite(CHAT_REQUEST_MAX_RETRIES) && CHAT_REQUEST_MAX_RETRIES > 0
+            ? Math.floor(CHAT_REQUEST_MAX_RETRIES)
+            : 1
+    );
+
+    let lastError = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+        try {
+            const response = await fetch(`${getServiceUrl('chat')}/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ messages, temperature, model }),
+                signal: controller.signal
+            });
+
+            const data = await response.json().catch(() => ({}));
+
+            if (!response.ok) {
+                const errorMessage = data?.error || `Chat service returned status ${response.status}`;
+                const shouldRetry = [429, 503, 504].includes(response.status);
+
+                if (shouldRetry && attempt < maxAttempts - 1) {
+                    const retryAfterHeader = response.headers.get('retry-after');
+                    const retryAfterMs = parseRetryAfterHeader(retryAfterHeader);
+                    const waitMs = calculateBackoffDelay(attempt, retryAfterMs);
+                    if (waitMs > 0) {
+                        await delay(waitMs);
+                    }
+                    continue;
+                }
+
+                const error = new Error(errorMessage);
+                error.status = response.status;
+                throw error;
+            }
+
+            const reply = typeof data?.reply === 'string' ? data.reply.trim() : '';
+
+            if (!reply) {
+                throw new Error('Chat service returned an empty reply.');
+            }
+
+            if (shouldUseCompletionCache && cacheKey) {
+                storeChatCompletion(cacheKey, reply);
+            }
+
+            return reply;
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                const timeoutError = new Error(`Chat service timed out after ${timeoutMs}ms`);
+                timeoutError.code = 'CHAT_TIMEOUT';
+                throw timeoutError;
+            }
+
+            lastError = error;
+
+            if (attempt < maxAttempts - 1) {
+                const waitMs = calculateBackoffDelay(attempt);
+                if (waitMs > 0) {
+                    await delay(waitMs);
+                }
+                continue;
+            }
+
+            console.error('Chat service error:', error);
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    if (lastError) {
+        console.error('Chat service error:', lastError);
+        throw lastError;
+    }
+
+    throw new Error('Chat completion failed without a specific error.');
 }
 
 function isRateLimited(chatId) {
@@ -356,13 +588,11 @@ function normalisePredefinedEntry(entry) {
 const FALLBACK_MEMORY = { predefinedResponses: [] };
 const FALLBACK_GENERAL_RESPONSES = [];
 
-let memory = normaliseMemory(readJsonFile(MEMORY_FILE, FALLBACK_MEMORY));
-let allResponses = normaliseAllResponses(readJsonFile(RESPONSES_FILE, {}));
-let generalResponses = normaliseGeneralResponses(readJsonFile(GENERAL_RESPONSES_FILE, FALLBACK_GENERAL_RESPONSES));
+let memory = normaliseMemory(FALLBACK_MEMORY);
+let allResponses = normaliseAllResponses({});
+let generalResponses = normaliseGeneralResponses(FALLBACK_GENERAL_RESPONSES);
 const chatCache = new Map();
-
-// Ensure the memory file only contains predefined responses going forward.
-saveMemory();
+const dataReady = initialiseData();
 
 function normaliseMemory(rawMemory) {
     if (!rawMemory || typeof rawMemory !== 'object' || Array.isArray(rawMemory)) {
@@ -430,6 +660,24 @@ function normaliseAllResponses(raw) {
     return result;
 }
 
+async function initialiseData() {
+    try {
+        const [rawMemory, rawResponses, rawGeneralResponses] = await Promise.all([
+            readJsonFile(MEMORY_FILE, FALLBACK_MEMORY),
+            readJsonFile(RESPONSES_FILE, {}),
+            readJsonFile(GENERAL_RESPONSES_FILE, FALLBACK_GENERAL_RESPONSES)
+        ]);
+
+        memory = normaliseMemory(rawMemory);
+        allResponses = normaliseAllResponses(rawResponses);
+        generalResponses = normaliseGeneralResponses(rawGeneralResponses);
+        chatCache.clear();
+        saveMemory();
+    } catch (error) {
+        console.error('⚠️ Failed to initialise persisted data:', error);
+    }
+}
+
 function hydrateChatState(chatId) {
     const records = allResponses[chatId] || [];
     const history = [];
@@ -469,15 +717,20 @@ function getChatState(chatId) {
 
 // Save memory & responses
 function saveMemory() {
+    const payload = { predefinedResponses: memory.predefinedResponses };
+    fileReadCache.set(MEMORY_FILE, payload);
+
     fs.promises.writeFile(
         MEMORY_FILE,
-        JSON.stringify({ predefinedResponses: memory.predefinedResponses }, null, 2)
+        JSON.stringify(payload, null, 2)
     ).catch((error) => {
         console.warn(`⚠️ Unable to write ${MEMORY_FILE}`, error);
     });
 }
 
 function writeAllResponsesToDisk() {
+    fileReadCache.set(RESPONSES_FILE, allResponses);
+
     fs.promises.writeFile(
         RESPONSES_FILE,
         JSON.stringify(allResponses, null, 2)
@@ -1419,6 +1672,8 @@ async function tryHandleMentionAll(message, cleanMessage, chatId) {
 }
 
 async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
+    await dataReady;
+
     if (!cleanMessage || !chatId.endsWith('@g.us')) return false;
     if (cleanMessage.startsWith(COMMAND_PREFIX)) return false;
 
@@ -1563,6 +1818,8 @@ function normaliseWid(wid) {
 
 // ---------------- MESSAGE HANDLER ----------------
 client.on('message', async (message) => {
+    await dataReady;
+
     const chatId = message.from;
     const isGroup = chatId.endsWith('@g.us');
     const isPrivate = chatId.endsWith('@s.whatsapp.net');
@@ -1721,6 +1978,7 @@ client.on('message', async (message) => {
 });
 
 async function startBot() {
+    await dataReady;
     await client.initialize();
     return client;
 }
