@@ -33,6 +33,23 @@ This folder contains a PHP reimplementation of the Emponyoo WhatsApp chatbot tha
 
 5. **Send a WhatsApp message** to the configured number. Meta forwards it to the webhook, the bot replies via the Cloud API, and the conversation state is persisted in `storage/`.
 
+### Running a local PHP server for testing
+
+You can use PHP's built-in development server to exercise the webhook without deploying it to shared hosting. This is handy when you want to validate the `.env` settings or inspect the JSON logs that are written to `storage/`.
+
+```bash
+# from the php-bot directory
+php -S 127.0.0.1:8000 -t public
+```
+
+The command serves the webhook entry point at `http://127.0.0.1:8000/index.php`. With the server running you can:
+
+- Manually open the URL in a browser with `?hub.challenge=1234&hub.mode=subscribe&hub.verify_token=your-token` to confirm the verification handshake logic works.
+- Use tools such as `curl` or the existing `npm run check:php` script in the project root to simulate webhook POST requests and inspect responses locally.
+- Review the generated JSON files under `storage/` to make sure conversations and quick replies are being recorded as expected.
+
+> **Tip:** The built-in server is single-threaded and meant for development only. When you're satisfied with local testing, deploy the contents of `public/` (and the supporting `src/` files) to your production PHP host.
+
 ## Folder structure
 - `composer.json` – project dependencies and PSR-4 autoload rules.
 - `data/` – predefined replies (`memory.json`, `general_responses.json`).
