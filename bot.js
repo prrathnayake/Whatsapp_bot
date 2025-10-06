@@ -11,22 +11,37 @@ const {
     SENSITIVE_PATTERNS,
     SYSTEM_PROMPT,
     TYPING_DELAY_MS,
+    MIN_TYPING_DELAY_MS,
+    TYPING_DELAY_PER_CHAR_MS,
     RATE_LIMIT_MS,
     MAX_MESSAGE_LENGTH,
     CONTEXT_LIMIT,
     MAX_SAVED_HISTORY,
     MAX_SAVED_RESPONSES,
     MAX_SAVED_QUICK_REPLIES,
+    SAVE_DEBOUNCE_MS,
     SAFE_FAILURE_MESSAGE,
     PRIVACY_SUMMARY,
     MEMORY_FILE,
     RESPONSES_FILE,
     GENERAL_RESPONSES_FILE,
+    MODERATION_CACHE_TTL_MS,
+    MODERATION_CACHE_MAX_ENTRIES,
     PUPPETEER_OPTIONS
 } = require('./config');
 
 const chatCooldowns = new Map();
+const moderationCache = new Map();
 let selfId = null;
+let saveAllResponsesTimer = null;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function escapeRegex(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const BOT_NAME_REGEX = new RegExp(`\\b${escapeRegex(BOT_NAME)}\\b[,\\s]*`, 'i');
+const BOT_NAME_REPLACE_REGEX = new RegExp(`\\b${escapeRegex(BOT_NAME)}\\b[,\\s]*`, 'ig');
 // ----------------------------------------
 
 const client = new Client({
@@ -46,14 +61,76 @@ function readJsonFile(filePath, fallback) {
     }
 }
 
+const shouldUseModerationCache =
+    Number.isFinite(MODERATION_CACHE_TTL_MS) && MODERATION_CACHE_TTL_MS > 0 &&
+    Number.isFinite(MODERATION_CACHE_MAX_ENTRIES) && MODERATION_CACHE_MAX_ENTRIES > 0;
+
+function getModerationCacheKey(text, type) {
+    return `${type}:${text}`;
+}
+
+function getCachedModerationResult(cacheKey) {
+    const cached = moderationCache.get(cacheKey);
+    if (!cached) return null;
+
+    if (cached.expiresAt < Date.now()) {
+        moderationCache.delete(cacheKey);
+        return null;
+    }
+
+    return cached.result;
+}
+
+function storeModerationResult(cacheKey, result) {
+    const now = Date.now();
+    moderationCache.set(cacheKey, {
+        result,
+        expiresAt: now + MODERATION_CACHE_TTL_MS,
+        createdAt: now
+    });
+
+    if (moderationCache.size <= MODERATION_CACHE_MAX_ENTRIES) return;
+
+    let oldestKey = null;
+    let oldestTimestamp = Infinity;
+
+    for (const [key, entry] of moderationCache.entries()) {
+        if (entry.expiresAt < now) {
+            moderationCache.delete(key);
+            continue;
+        }
+
+        if (entry.createdAt < oldestTimestamp) {
+            oldestTimestamp = entry.createdAt;
+            oldestKey = key;
+        }
+    }
+
+    if (moderationCache.size > MODERATION_CACHE_MAX_ENTRIES && oldestKey) {
+        moderationCache.delete(oldestKey);
+    }
+}
+
 async function moderateContent(text, type = 'input') {
-    if (!text) return { flagged: false, categories: [], type };
+    const normalisedText = typeof text === 'string' ? text.trim() : '';
+    if (!normalisedText) {
+        return { flagged: false, categories: [], type };
+    }
+
+    const cacheKey = shouldUseModerationCache ? getModerationCacheKey(normalisedText, type) : null;
+
+    if (cacheKey) {
+        const cachedResult = getCachedModerationResult(cacheKey);
+        if (cachedResult) {
+            return cachedResult;
+        }
+    }
 
     try {
         const response = await fetch(`${getServiceUrl('moderation')}/moderate`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ input: text, type })
+            body: JSON.stringify({ input: normalisedText, type })
         });
 
         const data = await response.json().catch(() => ({}));
@@ -64,11 +141,17 @@ async function moderateContent(text, type = 'input') {
 
         const categories = Array.isArray(data?.categories) ? data.categories : [];
 
-        return {
+        const result = {
             flagged: Boolean(data?.flagged),
             categories,
             type: data?.type || type
         };
+
+        if (cacheKey) {
+            storeModerationResult(cacheKey, result);
+        }
+
+        return result;
     } catch (error) {
         console.warn('⚠️ Moderation request failed:', error);
         return { flagged: false, categories: [], type };
@@ -379,13 +462,33 @@ function saveMemory() {
     });
 }
 
-function saveAllResponses() {
+function writeAllResponsesToDisk() {
     fs.promises.writeFile(
         RESPONSES_FILE,
         JSON.stringify(allResponses, null, 2)
     ).catch((error) => {
         console.warn(`⚠️ Unable to write ${RESPONSES_FILE}`, error);
     });
+}
+
+function scheduleAllResponsesSave(immediate = false) {
+    const debounceMs = Number.isFinite(SAVE_DEBOUNCE_MS) ? Math.max(0, SAVE_DEBOUNCE_MS) : 0;
+
+    if (immediate || debounceMs === 0) {
+        if (saveAllResponsesTimer) {
+            clearTimeout(saveAllResponsesTimer);
+            saveAllResponsesTimer = null;
+        }
+        writeAllResponsesToDisk();
+        return;
+    }
+
+    if (saveAllResponsesTimer) return;
+
+    saveAllResponsesTimer = setTimeout(() => {
+        saveAllResponsesTimer = null;
+        writeAllResponsesToDisk();
+    }, debounceMs);
 }
 
 function appendResponse(chatId, record) {
@@ -402,7 +505,7 @@ function appendResponse(chatId, record) {
         allResponses[chatId] = allResponses[chatId].slice(-MAX_SAVED_RESPONSES);
     }
 
-    saveAllResponses();
+    scheduleAllResponsesSave();
 }
 
 function recordInteraction(chatId, userMessage, reply, source = 'system') {
@@ -472,8 +575,45 @@ function describeResponseForLog(response) {
     return '[response]';
 }
 
+function getResponseLength(response) {
+    if (!response) return 0;
+
+    if (typeof response === 'string') {
+        return response.length;
+    }
+
+    const text = getResponseText(response);
+    return text.length;
+}
+
+function calculateTypingDelay(response) {
+    const maxDelay = Number.isFinite(TYPING_DELAY_MS) ? Math.max(0, TYPING_DELAY_MS) : 0;
+    const minDelay = Number.isFinite(MIN_TYPING_DELAY_MS)
+        ? Math.max(0, MIN_TYPING_DELAY_MS)
+        : Math.min(350, maxDelay || 350);
+    const perChar = Number.isFinite(TYPING_DELAY_PER_CHAR_MS)
+        ? Math.max(0, TYPING_DELAY_PER_CHAR_MS)
+        : 0;
+
+    if (perChar === 0) {
+        return Math.max(minDelay, maxDelay);
+    }
+
+    const dynamicDelay = minDelay + getResponseLength(response) * perChar;
+    const cap = Math.max(minDelay, maxDelay);
+
+    if (cap === 0) {
+        return dynamicDelay;
+    }
+
+    return Math.min(dynamicDelay, cap);
+}
+
 async function sendWithTyping(message, response) {
-    await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
+    const delayMs = calculateTypingDelay(response);
+    if (delayMs > 0) {
+        await delay(delayMs);
+    }
 
     if (!response) {
         await message.reply(SAFE_FAILURE_MESSAGE);
@@ -1149,6 +1289,14 @@ async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
         return true;
     }
 
+    if (isRateLimited(chatId)) {
+        const reply = 'I\'m wrapping up another request—please try again in a moment.';
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'system');
+        return true;
+    }
+
     const inputModeration = await moderateContent(cleanMessage, 'input');
     if (inputModeration.flagged) {
         console.warn(`⚠️ Moderation blocked a ${inputModeration.type} message in chat ${chatId}. Categories: ${inputModeration.categories.join(', ') || 'n/a'}`);
@@ -1159,23 +1307,17 @@ async function tryHandleGeneralMessage(message, cleanMessage, chatId) {
         return true;
     }
 
-    if (isRateLimited(chatId)) {
-        const reply = 'I\'m wrapping up another request—please try again in a moment.';
-        await sendWithTyping(message, reply);
-        chatCooldowns.set(chatId, Date.now());
-        recordInteraction(chatId, cleanMessage, reply, 'system');
-        return true;
-    }
-
     let replyPayload = generalResponse;
     let outputSource = 'general';
 
     const moderationTarget = getResponseText(replyPayload);
-    const outputModeration = await moderateContent(moderationTarget, 'output');
-    if (outputModeration.flagged) {
-        console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
-        replyPayload = SAFE_FAILURE_MESSAGE;
-        outputSource = 'safety';
+    if (moderationTarget) {
+        const outputModeration = await moderateContent(moderationTarget, 'output');
+        if (outputModeration.flagged) {
+            console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+            replyPayload = SAFE_FAILURE_MESSAGE;
+            outputSource = 'safety';
+        }
     }
 
     await sendWithTyping(message, replyPayload);
@@ -1201,7 +1343,7 @@ async function handleCommand(command, chatId, args = '') {
         });
         if (allResponses[chatId]) {
             delete allResponses[chatId];
-            saveAllResponses();
+            scheduleAllResponsesSave(true);
         }
         return 'Our conversation history has been cleared. Feel free to start fresh!';
     case 'history':
@@ -1271,10 +1413,9 @@ client.on('message', async (message) => {
         shouldRespond = true; // respond to all private messages
     } else if (isGroup) {
         // Trigger if message contains the bot name
-        const regex = new RegExp(`\\b${BOT_NAME}\\b[,\\s]*`, 'i');
-        if (regex.test(rawBody)) {
+        if (BOT_NAME_REGEX.test(rawBody)) {
             shouldRespond = true;
-            const withoutName = rawBody.replace(regex, '').trim();
+            const withoutName = rawBody.replace(BOT_NAME_REPLACE_REGEX, '').trim();
             if (withoutName) {
                 cleanMessage = withoutName;
             }
@@ -1357,6 +1498,14 @@ client.on('message', async (message) => {
         return;
     }
 
+    if (isRateLimited(chatId)) {
+        const reply = 'I\'m wrapping up another request—please try again in a moment.';
+        await sendWithTyping(message, reply);
+        chatCooldowns.set(chatId, Date.now());
+        recordInteraction(chatId, cleanMessage, reply, 'system');
+        return;
+    }
+
     const inputModeration = await moderateContent(cleanMessage, 'input');
     if (inputModeration.flagged) {
         console.warn(`⚠️ Moderation blocked a ${inputModeration.type} message in chat ${chatId}. Categories: ${inputModeration.categories.join(', ') || 'n/a'}`);
@@ -1364,14 +1513,6 @@ client.on('message', async (message) => {
         await sendWithTyping(message, reply);
         chatCooldowns.set(chatId, Date.now());
         recordInteraction(chatId, cleanMessage, reply, 'safety');
-        return;
-    }
-
-    if (isRateLimited(chatId)) {
-        const reply = 'I\'m wrapping up another request—please try again in a moment.';
-        await sendWithTyping(message, reply);
-        chatCooldowns.set(chatId, Date.now());
-        recordInteraction(chatId, cleanMessage, reply, 'system');
         return;
     }
 
@@ -1397,11 +1538,13 @@ client.on('message', async (message) => {
 
     let outputSource = responseSource;
     const moderationTarget = typeof replyPayload === 'string' ? replyPayload : getResponseText(replyPayload);
-    const outputModeration = await moderateContent(moderationTarget, 'output');
-    if (outputModeration.flagged) {
-        console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
-        replyPayload = SAFE_FAILURE_MESSAGE;
-        outputSource = 'safety';
+    if (moderationTarget) {
+        const outputModeration = await moderateContent(moderationTarget, 'output');
+        if (outputModeration.flagged) {
+            console.warn(`⚠️ Moderation adjusted an ${outputModeration.type} message in chat ${chatId}. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+            replyPayload = SAFE_FAILURE_MESSAGE;
+            outputSource = 'safety';
+        }
     }
 
     await sendWithTyping(message, replyPayload);
