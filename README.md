@@ -38,6 +38,14 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 
 If you need to stay on PHP-only hosting, use the rewritten bot in [`php-bot/`](./php-bot/README.md). It integrates with the official WhatsApp Cloud API instead of Puppeteer and can be deployed as a standard PHP webhook. Follow the README in that folder for composer installation, webhook verification, and environment variables.
 
+To confirm the webhook behaves as expected without deploying it, you can run a lightweight check from the project root:
+
+```bash
+npm run check:php
+```
+
+The script starts PHP's built-in server, exercises the verification handshake, and posts a sample payload to ensure the endpoint responds just like the Node.js entry point.
+
 ## Commands
 
 | Command    | Description |
