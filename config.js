@@ -46,6 +46,7 @@ const config = {
     GENERAL_RESPONSES_FILE: path.join(__dirname, 'general_responses.json'),
     MODERATION_CACHE_TTL_MS: 5 * 60 * 1000,
     MODERATION_CACHE_MAX_ENTRIES: 500,
+    CHAT_REQUEST_TIMEOUT_MS: 20 * 1000,
     PUPPETEER_OPTIONS: { headless: false }
 };
 
