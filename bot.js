@@ -27,6 +27,7 @@ const {
     GENERAL_RESPONSES_FILE,
     MODERATION_CACHE_TTL_MS,
     MODERATION_CACHE_MAX_ENTRIES,
+    CHAT_REQUEST_TIMEOUT_MS,
     PUPPETEER_OPTIONS
 } = require('./config');
 
@@ -175,11 +176,18 @@ async function requestChatCompletion({ messages, temperature = 0.7, model = 'gpt
         throw new Error('Chat completion requires at least one message.');
     }
 
+    const timeoutMs = Number.isFinite(CHAT_REQUEST_TIMEOUT_MS) && CHAT_REQUEST_TIMEOUT_MS > 0
+        ? CHAT_REQUEST_TIMEOUT_MS
+        : 20000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
         const response = await fetch(`${getServiceUrl('chat')}/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages, temperature, model })
+            body: JSON.stringify({ messages, temperature, model }),
+            signal: controller.signal
         });
 
         const data = await response.json().catch(() => ({}));
@@ -196,8 +204,15 @@ async function requestChatCompletion({ messages, temperature = 0.7, model = 'gpt
 
         return reply;
     } catch (error) {
+        if (error.name === 'AbortError') {
+            const timeoutError = new Error(`Chat service timed out after ${timeoutMs}ms`);
+            timeoutError.code = 'CHAT_TIMEOUT';
+            throw timeoutError;
+        }
         console.error('Chat service error:', error);
         throw error;
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
@@ -848,10 +863,12 @@ function buildHelpMessage() {
         `${COMMAND_PREFIX}policy - Read how I keep conversations safe`,
         `${COMMAND_PREFIX}privacy - Understand what I store`,
         `${COMMAND_PREFIX}stats - See usage insights for this chat`,
+        `${COMMAND_PREFIX}summary [focus] - Recap our recent conversation with an optional focus`,
         `${COMMAND_PREFIX}songs <mood or artist> - Discover tailored music suggestions`,
         `${COMMAND_PREFIX}songlink <song name> - Grab a quick YouTube link for a track`,
         `${COMMAND_PREFIX}plan <goal or situation> - Get a quick day-to-day action plan`,
         `${COMMAND_PREFIX}meal <ingredients or dietary need> - Receive speedy meal ideas`,
+        `${COMMAND_PREFIX}translate <language> <text> - Translate a message instantly`,
         `${COMMAND_PREFIX}image <prompt> - Generate an AI image (limited daily uses)`,
         `${COMMAND_PREFIX}about - Learn more about ${BOT_NAME}`
     ].join('\n');
@@ -1088,6 +1105,145 @@ async function handleImageCommand(chatId, args) {
         mediaBase64: image.base64,
         mediaMimeType: image.mimeType || 'image/png'
     };
+}
+
+function buildConversationTranscript(entries) {
+    return entries
+        .map((entry) => {
+            const speaker = entry.role === 'assistant' ? BOT_NAME : 'User';
+            return `${speaker}: ${entry.content}`;
+        })
+        .join('\n');
+}
+
+async function buildConversationSummary(chatId, focus) {
+    const chatState = getChatState(chatId);
+    const trimmedFocus = typeof focus === 'string' ? focus.trim() : '';
+
+    if (trimmedFocus) {
+        const focusModeration = await moderateContent(trimmedFocus, 'input');
+        if (focusModeration.flagged) {
+            console.warn(`⚠️ Moderation blocked a summary focus phrase. Categories: ${focusModeration.categories.join(', ') || 'n/a'}`);
+            return SAFE_FAILURE_MESSAGE;
+        }
+    }
+
+    const recentHistory = chatState.history.slice(-Math.max(8, Math.min(20, CONTEXT_LIMIT)));
+    if (recentHistory.length === 0) {
+        return 'There is no recent conversation to summarise yet.';
+    }
+
+    const transcript = buildConversationTranscript(recentHistory);
+    const transcriptModeration = await moderateContent(transcript, 'input');
+    if (transcriptModeration.flagged) {
+        console.warn(`⚠️ Moderation blocked a transcript summary. Categories: ${transcriptModeration.categories.join(', ') || 'n/a'}`);
+        return SAFE_FAILURE_MESSAGE;
+    }
+
+    const focusLine = trimmedFocus ? `Focus on: ${trimmedFocus}\n` : '';
+    const systemContent = [
+        SYSTEM_PROMPT,
+        'You are summarising a WhatsApp chat for the user.',
+        'Keep the tone neutral, highlight key takeaways, and suggest next steps if relevant.',
+        'Respond with a short intro sentence followed by up to three concise bullet points.'
+    ].join('\n');
+
+    try {
+        const summary = await requestChatCompletion({
+            messages: [
+                { role: 'system', content: systemContent },
+                {
+                    role: 'user',
+                    content: `${focusLine}Summarise this conversation between the user and ${BOT_NAME}:\n${transcript}`
+                }
+            ],
+            temperature: 0.4
+        });
+
+        const outputModeration = await moderateContent(summary, 'output');
+        if (outputModeration.flagged) {
+            console.warn(`⚠️ Moderation adjusted a conversation summary. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+            return SAFE_FAILURE_MESSAGE;
+        }
+
+        return summary;
+    } catch (error) {
+        if (error?.code === 'CHAT_TIMEOUT') {
+            return 'The summary request is taking too long. Please try again shortly.';
+        }
+        console.error('Unable to generate conversation summary:', error);
+        return 'I could not build a summary just now. Please try again in a moment.';
+    }
+}
+
+async function translateText(args) {
+    const trimmed = typeof args === 'string' ? args.trim() : '';
+    if (!trimmed) {
+        return `Please provide the target language and the text to translate, e.g. ${COMMAND_PREFIX}translate spanish How are you?`;
+    }
+
+    let targetLanguage = '';
+    let textToTranslate = '';
+
+    const colonIndex = trimmed.indexOf(':');
+    const pipeIndex = trimmed.indexOf('|');
+    const separatorIndex = colonIndex !== -1 ? colonIndex : pipeIndex;
+
+    if (separatorIndex !== -1) {
+        targetLanguage = trimmed.slice(0, separatorIndex).trim();
+        textToTranslate = trimmed.slice(separatorIndex + 1).trim();
+    } else {
+        const parts = trimmed.split(/\s+/);
+        targetLanguage = parts.shift();
+        textToTranslate = parts.join(' ').trim();
+    }
+
+    if (!targetLanguage || !textToTranslate) {
+        return `Please specify both the language and the text, for example: ${COMMAND_PREFIX}translate French I like learning new things.`;
+    }
+
+    const inputModeration = await moderateContent(textToTranslate, 'input');
+    if (inputModeration.flagged) {
+        console.warn(`⚠️ Moderation blocked a translation request. Categories: ${inputModeration.categories.join(', ') || 'n/a'}`);
+        return SAFE_FAILURE_MESSAGE;
+    }
+
+    const systemContent = [
+        SYSTEM_PROMPT,
+        'You are a precise translation assistant.',
+        'Return only the translated text unless extra context is essential for accuracy.'
+    ].join('\n');
+
+    const userContent = [
+        `Translate the following message into ${targetLanguage}:`,
+        textToTranslate,
+        '',
+        'If the message is already in that language, provide a polished version and mention that it was already in the target language.'
+    ].join('\n');
+
+    try {
+        const translation = await requestChatCompletion({
+            messages: [
+                { role: 'system', content: systemContent },
+                { role: 'user', content: userContent }
+            ],
+            temperature: 0.3
+        });
+
+        const outputModeration = await moderateContent(translation, 'output');
+        if (outputModeration.flagged) {
+            console.warn(`⚠️ Moderation adjusted a translation output. Categories: ${outputModeration.categories.join(', ') || 'n/a'}`);
+            return SAFE_FAILURE_MESSAGE;
+        }
+
+        return translation;
+    } catch (error) {
+        if (error?.code === 'CHAT_TIMEOUT') {
+            return 'The translation is taking longer than expected. Please try again shortly.';
+        }
+        console.error('Unable to translate text:', error);
+        return 'I could not translate that right now. Please try again in a moment.';
+    }
 }
 
 function formatHistorySummary(chatId) {
@@ -1357,6 +1513,10 @@ async function handleCommand(command, chatId, args = '') {
         return buildPrivacyMessage();
     case 'stats':
         return buildStatsMessage(chatId);
+    case 'summary':
+    case 'summarise':
+    case 'summarize':
+        return await buildConversationSummary(chatId, args);
     case 'song':
     case 'songs':
         return await buildSongSuggestions(args);
@@ -1373,6 +1533,8 @@ async function handleCommand(command, chatId, args = '') {
     case 'recipe':
     case 'recipes':
         return await buildMealIdeas(args);
+    case 'translate':
+        return await translateText(args);
     case 'image':
     case 'images':
     case 'img':

@@ -15,6 +15,8 @@ A feature-rich WhatsApp chatbot powered by the [whatsapp-web.js](https://github.
 - 🛡️ Safety features including OpenAI moderation, sensitive data detection, and per-chat rate limiting
 - 🎵 Instant YouTube song link discovery via `!songlink`
 - 🖼️ Daily limited AI image generation via `!image`
+- 🧾 Instant conversation recaps via `!summary`
+- 🌐 On-demand message translation with `!translate`
 
 ## Getting Started
 
@@ -47,10 +49,12 @@ If you need to stay on PHP-only hosting, use the rewritten bot in [`php-bot/`](.
 | `!policy`  | Display the assistant's safety guidelines |
 | `!privacy` | Explain what data is stored and how to clear it |
 | `!stats`   | Share usage insights for the current chat |
+| `!summary [focus]` | Summarise the recent conversation, optionally emphasising a topic |
 | `!songs <mood or artist>` | Suggest a short list of matching songs |
 | `!plan <goal or situation>` | Draft a quick plan for everyday tasks |
 | `!meal <ingredients or dietary need>` | Offer speedy meal or recipe ideas |
 | `!songlink <song name>` | Find the top YouTube result for a requested track |
+| `!translate <language> <text>` | Translate a message into the chosen language |
 | `!image <prompt>` | Generate an AI image (limited to a few per chat each day) |
 | `!about`   | Learn about the bot |
 
